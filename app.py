@@ -6,6 +6,8 @@ import hashlib
 from io import BytesIO
 from datetime import datetime, timedelta, date
 import calendar
+import math
+import openpyxl
 
 # =========================================================
 # Config
@@ -17,6 +19,37 @@ PRINCIPAL_KEYWORDS = {"메디칼론원금"}  # 원금상환(지출 아님) 제�
 DOW_KO = ["월", "화", "수", "목", "금", "토", "일"]
 
 st.set_page_config(page_title="현금흐름 MVP", layout="wide")
+
+# =========================================================
+# Display helpers (Streamlit format 에러 회피용)
+# =========================================================
+def fmt_int(x):
+    if x is None:
+        return ""
+    try:
+        if isinstance(x, (np.integer, int)):
+            return f"{int(x):,}"
+        if isinstance(x, (np.floating, float)):
+            if math.isnan(x):
+                return ""
+            return f"{int(round(x, 0)):,}"
+        if isinstance(x, str) and x.strip() == "":
+            return ""
+        return f"{int(float(x)):,}"
+    except Exception:
+        return str(x)
+
+def fmt_dt(x):
+    if pd.isna(x) or x is None:
+        return ""
+    if isinstance(x, (datetime, pd.Timestamp)):
+        return str(x)
+    return str(x)
+
+def month_range(year: int, month: int):
+    first = date(year, month, 1)
+    last = date(year, month, calendar.monthrange(year, month)[1])
+    return first, last
 
 # =========================================================
 # Utils
@@ -41,19 +74,39 @@ def make_tx_id(posted_at: pd.Timestamp, account_name: str, direction: str, amoun
     base = f"{posted_at.isoformat()}|{account_name}|{direction}|{amount}|{counterparty or ''}"
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
-def month_range(year: int, month: int):
-    first = date(year, month, 1)
-    last = date(year, month, calendar.monthrange(year, month)[1])
-    return first, last
-
 @st.cache_data(show_spinner=False)
 def detect_template_workbook(file_bytes: bytes) -> bool:
-    """
-    현금흐름 원본 엑셀(시트: '이카운트 DB' 포함) 여부 간단 감지
-    """
-    import openpyxl
     wb = openpyxl.load_workbook(BytesIO(file_bytes), read_only=True, data_only=True)
     return "이카운트 DB" in wb.sheetnames and "월수입지출" in wb.sheetnames
+
+@st.cache_data(show_spinner=False)
+def parse_template_available_map(file_bytes: bytes) -> dict:
+    """
+    템플릿 '월수입지출' 시트에서 날짜별 '가용가능금액'(I열=9)을 추출.
+    - A열 날짜가 비어있는 행은 직전 날짜의 연속 라인으로 간주(엑셀 구조 그대로)
+    - 날짜별 마지막 가용가능금액을 저장
+    """
+    wb = openpyxl.load_workbook(BytesIO(file_bytes), read_only=True, data_only=True)
+    ws = wb["월수입지출"]
+
+    date_col = 1  # A
+    avail_col = 9 # I (가용가능금액)
+    current_date = None
+    last_by_date = {}
+
+    for r in range(1, ws.max_row + 1):
+        d = ws.cell(r, date_col).value
+
+        if isinstance(d, datetime):
+            current_date = d.date()
+        elif isinstance(d, date):
+            current_date = d
+
+        v = ws.cell(r, avail_col).value
+        if current_date and isinstance(v, (int, float)) and not (isinstance(v, float) and math.isnan(v)):
+            last_by_date[current_date] = int(v)
+
+    return last_by_date
 
 # =========================================================
 # Parsers
@@ -61,7 +114,7 @@ def detect_template_workbook(file_bytes: bytes) -> bool:
 @st.cache_data(show_spinner=False)
 def parse_template_cashflow(file_bytes: bytes) -> pd.DataFrame:
     """
-    '히즈메디 현금흐름- 원본본.xlsx' 같은 템플릿 파일 파싱
+    '히즈메디 현금흐름- 원본본.xlsx' 템플릿 파일 파싱
     - sheet: '이카운트 DB'
     - 사용 컬럼: 입/출금일자, 입/출, 변환금액, 계좌명, 입금처(출금처), 원화잔액, 거래처코드
     """
@@ -75,25 +128,22 @@ def parse_template_cashflow(file_bytes: bytes) -> pd.DataFrame:
     df["posted_at"] = safe_to_datetime_series(df["입/출금일자"])
     df = df[df["posted_at"].notna()].copy()
 
-    # 템플릿의 '변환금액'은 이미 내부이동/원금상환 제외 로직이 반영돼 있을 수 있음
+    # 템플릿의 '변환금액'은 이미 내부이동/원금상환 제외 로직이 들어간 값으로 보임(엑셀 베이스라인)
     df["amount"] = pd.to_numeric(df["변환금액"], errors="coerce")
     df = df[df["amount"].notna()].copy()
     df["amount"] = df["amount"].astype(int)
 
-    # direction/subtype
     df["subtype"] = np.where(df["입/출"].astype(str).str.contains("청구"), "CLAIM", "NORMAL")
     df["direction"] = np.where(df["입/출"].astype(str).str.startswith("출금"), "OUT", "IN")
 
     df["account_name"] = df["계좌명"].astype(str)
     df["counterparty"] = df["입금처(출금처)"].astype(str)
 
-    # flags
     df["is_excluded_account"] = df["account_name"].isin(EXCLUDED_ACCOUNT_NAMES)
     df["is_principal"] = df["counterparty"].isin(PRINCIPAL_KEYWORDS)
-    df["is_internal_auto"] = df["거래처코드"].astype(str).eq("자금이동")  # 템플릿에서 수기표시
+    df["is_internal_auto"] = df["거래처코드"].astype(str).eq("자금이동")
 
     df["balance"] = pd.to_numeric(df["원화잔액"], errors="coerce")
-
     df["biz_date"] = df["posted_at"].dt.date
 
     df["tx_id"] = df.apply(
@@ -179,10 +229,6 @@ def parse_any_excel(file_bytes: bytes) -> pd.DataFrame:
 # Internal transfer candidate matching
 # =========================================================
 def build_internal_candidates(tx: pd.DataFrame) -> pd.DataFrame:
-    """
-    후보 생성: 동일금액 + 반대방향 + 서로 다른 계좌 + 2시간 이내 + 1:1(가장 가까운 거래)
-    템플릿의 is_internal_auto(자금이동)는 후보 계산과 별개로 자동 제외로 취급.
-    """
     base = tx[
         (~tx["is_excluded_account"]) &
         (~tx["is_principal"])
@@ -227,13 +273,9 @@ def build_internal_candidates(tx: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 # =========================================================
-# Balance computation (from per-account balances)
+# Balance computation (fallback)
 # =========================================================
 def compute_total_balance_at(tx: pd.DataFrame, at_dt: datetime) -> float | None:
-    """
-    at_dt 시점까지 각 계좌의 마지막 원화잔액을 합산.
-    balance 컬럼이 거의 비어있으면 None 반환.
-    """
     base = tx[(~tx["is_excluded_account"])].copy()
     if base["balance"].notna().sum() == 0:
         return None
@@ -241,7 +283,6 @@ def compute_total_balance_at(tx: pd.DataFrame, at_dt: datetime) -> float | None:
     total = 0.0
     for acct, g in base.groupby("account_name"):
         g = g.sort_values("posted_at")
-
         before = g[g["posted_at"] <= at_dt]
         if len(before) > 0 and pd.notna(before.iloc[-1]["balance"]):
             total += float(before.iloc[-1]["balance"])
@@ -263,10 +304,6 @@ def compute_total_balance_at(tx: pd.DataFrame, at_dt: datetime) -> float | None:
 # Aggregations
 # =========================================================
 def daily_actuals(tx: pd.DataFrame, confirmed_pairs: set[tuple[str,str]]) -> pd.DataFrame:
-    """
-    일자별 실제 입/출(병원범위) 계산
-    제외: excluded account, principal, internal_auto, confirmed internal pairs
-    """
     confirmed_out = {p[0] for p in confirmed_pairs}
     confirmed_in = {p[1] for p in confirmed_pairs}
     excluded_ids = confirmed_out.union(confirmed_in)
@@ -360,12 +397,17 @@ if not files:
 
 all_tx = []
 parse_errors = []
+available_maps = []  # 템플릿 월수입지출(가용가능금액) 맵들
+
 for f in files:
     b = f.getvalue()
     try:
-        tx = parse_any_excel(b)
-        tx["file_name"] = f.name
-        all_tx.append(tx)
+        if detect_template_workbook(b):
+            available_maps.append(parse_template_available_map(b))
+
+        tx_one = parse_any_excel(b)
+        tx_one["file_name"] = f.name
+        all_tx.append(tx_one)
     except Exception as e:
         parse_errors.append((f.name, str(e)))
 
@@ -387,8 +429,8 @@ if "confirmed_pairs" not in st.session_state:
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("거래기간", f"{min_dt.date()} ~ {max_dt.date()}")
 c2.metric("전체 거래(중복제거)", f"{len(tx):,}")
-c3.metric("제외계좌 건수", f"{tx['is_excluded_account'].sum():,}")
-c4.metric("원금상환(제외) 건수", f"{tx['is_principal'].sum():,}")
+c3.metric("제외계좌 건수", f"{int(tx['is_excluded_account'].sum()):,}")
+c4.metric("원금상환(제외) 건수", f"{int(tx['is_principal'].sum()):,}")
 
 page = st.sidebar.radio("페이지", ["월수입지출(핵심)", "내부이동 검수", "일자별 요약(피벗 대체)", "원장(거래 목록)"])
 
@@ -413,11 +455,11 @@ if page == "내부이동 검수":
 
             left, mid, right = st.columns([7,7,2])
             with left:
-                st.markdown(f"**OUT** {r['out_time']} / {r['out_account']} / {r['amount']:,}")
+                st.markdown(f"**OUT** {r['out_time']} / {r['out_account']} / {fmt_int(r['amount'])}")
                 if r.get("out_counterparty"):
                     st.caption(f"{r['out_counterparty']}")
             with mid:
-                st.markdown(f"**IN**  {r['in_time']} / {r['in_account']} / {r['amount']:,}")
+                st.markdown(f"**IN**  {r['in_time']} / {r['in_account']} / {fmt_int(r['amount'])}")
                 if r.get("in_counterparty"):
                     st.caption(f"{r['in_counterparty']}")
                 st.caption(f"time diff: {int(r['time_diff_seconds'])}s")
@@ -455,38 +497,25 @@ elif page == "일자별 요약(피벗 대체)":
         st.info("해당 월 데이터가 없습니다.")
     else:
         show_claim = st.toggle("심사청구(입금(청구)) 분리해서 보기", value=True)
-        act["biz_date"] = pd.to_datetime(act["biz_date"])
         act = act.sort_values("biz_date")
 
         disp = act.copy()
-        disp["biz_date"] = disp["biz_date"].dt.date
+        disp["날짜"] = disp["biz_date"].astype(str)
 
         if show_claim:
-            disp = disp[["biz_date","inflow_claim","inflow","outflow","total_inflow","net"]]
-            col_cfg = {
-                "biz_date": st.column_config.DateColumn("날짜"),
-                "inflow_claim": st.column_config.NumberColumn("입금(청구)", format="%,d"),
-                "inflow": st.column_config.NumberColumn("입금", format="%,d"),
-                "outflow": st.column_config.NumberColumn("출금", format="%,d"),
-                "total_inflow": st.column_config.NumberColumn("총입금", format="%,d"),
-                "net": st.column_config.NumberColumn("순증", format="%,d"),
-            }
+            disp["입금(청구)"] = disp["inflow_claim"].map(fmt_int)
+            disp["입금"] = disp["inflow"].map(fmt_int)
+            disp["출금"] = disp["outflow"].map(fmt_int)
+            disp["총입금"] = disp["total_inflow"].map(fmt_int)
+            disp["순증"] = disp["net"].map(fmt_int)
+            out = disp[["날짜","입금(청구)","입금","출금","총입금","순증"]]
         else:
-            disp = disp[["biz_date","total_inflow","outflow","net"]]
-            col_cfg = {
-                "biz_date": st.column_config.DateColumn("날짜"),
-                "total_inflow": st.column_config.NumberColumn("총입금", format="%,d"),
-                "outflow": st.column_config.NumberColumn("출금", format="%,d"),
-                "net": st.column_config.NumberColumn("순증", format="%,d"),
-            }
+            disp["총입금"] = disp["total_inflow"].map(fmt_int)
+            disp["출금"] = disp["outflow"].map(fmt_int)
+            disp["순증"] = disp["net"].map(fmt_int)
+            out = disp[["날짜","총입금","출금","순증"]]
 
-        st.dataframe(disp, use_container_width=True, hide_index=True, column_config=col_cfg)
-
-        if st.toggle("그래프 보기", value=False):
-            chart_df = disp.copy()
-            chart_df["biz_date"] = pd.to_datetime(chart_df["biz_date"])
-            chart_df = chart_df.set_index("biz_date")
-            st.line_chart(chart_df[[c for c in chart_df.columns if c!="biz_date"]])
+        st.dataframe(out, use_container_width=True, hide_index=True)
 
 # =========================================================
 # Page: Monthly cashflow (core)
@@ -501,24 +530,44 @@ elif page == "월수입지출(핵심)":
     year, month = map(int, sel.split("-"))
     first, last = month_range(year, month)
 
-    prev_day_end = datetime.combine(first - timedelta(days=1), datetime.max.time())
-    auto_start = compute_total_balance_at(tx, prev_day_end)
+    # ---- 시작잔고 자동값 후보 1: 템플릿 월수입지출(I열 가용가능금액 기반)
+    template_auto = None
+    template_source = None
+    if available_maps:
+        # 여러 템플릿이 올라올 수 있으니 "가장 정보가 많은 맵" 우선 사용
+        best_map = max(available_maps, key=lambda m: len(m))
+        prev = first - timedelta(days=1)
+        if prev in best_map:
+            template_auto = best_map[prev]
+            template_source = f"템플릿 월수입지출(전일 {prev})"
+        elif first in best_map:
+            template_auto = best_map[first]
+            template_source = f"템플릿 월수입지출(당일 {first})"
 
-    st.caption("시작잔고는 '전월말 각 계좌 잔액 합계'로 자동 계산을 시도합니다. (잔액 컬럼이 없으면 수동 입력)")
+    # ---- 시작잔고 자동값 후보 2: 원장 balance 컬럼 기반 추정(템플릿 없을 때 fallback)
+    prev_day_end = datetime.combine(first - timedelta(days=1), datetime.max.time())
+    balance_auto = compute_total_balance_at(tx, prev_day_end)
+
+    st.caption("시작잔고는 템플릿 파일이 있으면 '월수입지출' 가용가능금액을 우선 사용합니다. 없으면 원장 잔액 합계를 추정하거나 수동 입력합니다.")
 
     left, right = st.columns([3,2])
     with left:
-        if auto_start is None:
-            start_balance = st.number_input("시작잔고(수동 입력)", min_value=0, value=0, step=1_000_000, format="%d")
+        if template_auto is not None:
+            st.success(f"시작잔고 자동값: {fmt_int(template_auto)}  ({template_source})")
+            start_balance = st.number_input("시작잔고(수정 가능)", value=int(template_auto), step=1_000_000, format="%d")
+        elif balance_auto is not None:
+            st.info(f"시작잔고 추정값: {fmt_int(balance_auto)}  (원장 잔액 합계 추정)")
+            start_balance = st.number_input("시작잔고(수정 가능)", value=int(balance_auto), step=1_000_000, format="%d")
         else:
-            start_balance = st.number_input("시작잔고(자동값 수정 가능)", min_value=0, value=int(auto_start), step=1_000_000, format="%d")
+            start_balance = st.number_input("시작잔고(수동 입력)", value=0, step=1_000_000, format="%d")
+
     with right:
-        danger = st.number_input("경고 기준 잔액(이하)", min_value=-10_000_000_000, value=0, step=10_000_000, format="%d")
+        danger = st.number_input("경고 기준 잔액(이하)", value=0, step=10_000_000, format="%d")
 
     if "plan_df" not in st.session_state:
         st.session_state.plan_df = pd.DataFrame(columns=["date","direction","amount","label"])
 
-    st.subheader("예정 입력")
+    st.subheader("예정 입력 (베타: 세션 저장 / CSV로 보관)")
     colA, colB = st.columns([2,3])
 
     with colA:
@@ -552,7 +601,6 @@ elif page == "월수입지출(핵심)":
         )
 
     with colB:
-        st.caption("예정 입력은 베타에선 세션에만 유지됩니다. (필요하면 CSV로 저장하세요.)")
         st.session_state.plan_df = st.data_editor(
             st.session_state.plan_df,
             use_container_width=True,
@@ -560,7 +608,7 @@ elif page == "월수입지출(핵심)":
             column_config={
                 "date": st.column_config.DateColumn("날짜"),
                 "direction": st.column_config.SelectboxColumn("구분", options=["IN","OUT","입금","출금"]),
-                "amount": st.column_config.NumberColumn("금액", format="%,d"),
+                "amount": st.column_config.NumberColumn("금액"),
                 "label": st.column_config.TextColumn("항목/메모"),
             }
         )
@@ -570,7 +618,7 @@ elif page == "월수입지출(핵심)":
         plan_df=st.session_state.plan_df,
         year=year,
         month=month,
-        start_balance=start_balance,
+        start_balance=float(start_balance),
         confirmed_pairs=st.session_state.confirmed_pairs
     )
 
@@ -578,34 +626,28 @@ elif page == "월수입지출(핵심)":
     end_row = month_table.iloc[-1]
 
     s1, s2, s3, s4, s5 = st.columns(5)
-    s1.metric("시작잔고", f"{int(start_balance):,}")
-    s2.metric("월말 예상잔고", f"{int(end_row['end_balance']):,}")
-    s3.metric("최저 잔고", f"{int(min_row['end_balance']):,}")
+    s1.metric("시작잔고", fmt_int(start_balance))
+    s2.metric("월말 예상잔고", fmt_int(end_row["end_balance"]))
+    s3.metric("최저 잔고", fmt_int(min_row["end_balance"]))
     s4.metric("최저 잔고 날짜", f"{min_row['date']} ({min_row['dow']})")
     s5.metric("확정 내부이동(세션)", f"{len(st.session_state.confirmed_pairs):,}쌍")
 
     st.subheader("일자별 잔액 롤링표 (숫자 중심)")
-    month_table_disp = month_table.copy()
-    month_table_disp["warning"] = month_table_disp["end_balance"] <= int(danger)
+    disp = month_table.copy()
+    disp["날짜"] = disp["date"].astype(str)
+    disp["요일"] = disp["dow"].astype(str)
+    disp["시작잔고"] = disp["start_balance"].map(fmt_int)
+    disp["실제입금(청구)"] = disp["actual_in_claim"].map(fmt_int)
+    disp["실제입금"] = disp["actual_in"].map(fmt_int)
+    disp["실제출금"] = disp["actual_out"].map(fmt_int)
+    disp["예정입금"] = disp["plan_in"].map(fmt_int)
+    disp["예정출금"] = disp["plan_out"].map(fmt_int)
+    disp["순변동"] = disp["net_change"].map(fmt_int)
+    disp["종료잔고"] = disp["end_balance"].map(fmt_int)
+    disp["⚠️경고"] = month_table["end_balance"].astype(int) <= int(danger)
 
-    st.dataframe(
-        month_table_disp,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "date": st.column_config.DateColumn("날짜"),
-            "dow": st.column_config.TextColumn("요일"),
-            "start_balance": st.column_config.NumberColumn("시작잔고", format="%,d"),
-            "actual_in_claim": st.column_config.NumberColumn("실제입금(청구)", format="%,d"),
-            "actual_in": st.column_config.NumberColumn("실제입금", format="%,d"),
-            "actual_out": st.column_config.NumberColumn("실제출금", format="%,d"),
-            "plan_in": st.column_config.NumberColumn("예정입금", format="%,d"),
-            "plan_out": st.column_config.NumberColumn("예정출금", format="%,d"),
-            "net_change": st.column_config.NumberColumn("순변동", format="%,d"),
-            "end_balance": st.column_config.NumberColumn("종료잔고", format="%,d"),
-            "warning": st.column_config.CheckboxColumn(f"⚠️ {danger:,} 이하"),
-        },
-    )
+    out_cols = ["날짜","요일","시작잔고","실제입금(청구)","실제입금","실제출금","예정입금","예정출금","순변동","종료잔고","⚠️경고"]
+    st.dataframe(disp[out_cols], use_container_width=True, hide_index=True)
 
     st.download_button(
         "월수입지출(롤링표) CSV 다운로드",
@@ -633,24 +675,14 @@ elif page == "월수입지출(핵심)":
         )
         day_tx = day_tx.sort_values("posted_at")
 
-        show_cols = ["posted_at","account_name","direction","subtype","amount","counterparty","include_in_calc","source","file_name"]
-        disp = day_tx[show_cols].copy()
+        disp2 = day_tx[["posted_at","account_name","direction","subtype","amount","counterparty","include_in_calc","source","file_name"]].copy()
+        disp2["시간"] = disp2["posted_at"].map(fmt_dt)
+        disp2["금액"] = disp2["amount"].map(fmt_int)
 
         st.dataframe(
-            disp,
+            disp2[["시간","account_name","direction","subtype","금액","counterparty","include_in_calc","source","file_name"]],
             use_container_width=True,
-            hide_index=True,
-            column_config={
-                "posted_at": st.column_config.TextColumn("시간"),
-                "account_name": st.column_config.TextColumn("계좌"),
-                "direction": st.column_config.TextColumn("입/출"),
-                "subtype": st.column_config.TextColumn("구분"),
-                "amount": st.column_config.NumberColumn("금액", format="%,d"),
-                "counterparty": st.column_config.TextColumn("상대"),
-                "include_in_calc": st.column_config.CheckboxColumn("계산포함"),
-                "source": st.column_config.TextColumn("소스"),
-                "file_name": st.column_config.TextColumn("파일"),
-            }
+            hide_index=True
         )
 
 # =========================================================
@@ -673,14 +705,14 @@ else:
 
     df = df.sort_values("posted_at", ascending=False).head(500)
 
+    disp = df[["posted_at","biz_date","account_name","direction","subtype","amount","counterparty","balance","source","file_name","is_internal_auto","is_principal","is_excluded_account"]].copy()
+    disp["일시"] = disp["posted_at"].map(fmt_dt)
+    disp["일자"] = disp["biz_date"].astype(str)
+    disp["금액"] = disp["amount"].map(fmt_int)
+    disp["잔액"] = disp["balance"].map(fmt_int)
+
     st.dataframe(
-        df[["posted_at","biz_date","account_name","direction","subtype","amount","counterparty","balance","source","file_name","is_internal_auto","is_principal","is_excluded_account"]],
+        disp[["일시","일자","account_name","direction","subtype","금액","counterparty","잔액","source","file_name","is_internal_auto","is_principal","is_excluded_account"]],
         use_container_width=True,
-        hide_index=True,
-        column_config={
-            "posted_at": st.column_config.TextColumn("일시"),
-            "biz_date": st.column_config.DateColumn("일자"),
-            "amount": st.column_config.NumberColumn("금액", format="%,d"),
-            "balance": st.column_config.NumberColumn("잔액", format="%,d"),
-        }
+        hide_index=True
     )
