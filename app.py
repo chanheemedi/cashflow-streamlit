@@ -8,7 +8,37 @@ from datetime import datetime, timedelta, date
 import calendar
 import math
 import openpyxl
+import gspread
+from google.oauth2.service_account import Credentials
+from datetime import datetime
 
+@st.cache_resource
+def gs_client():
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    return gspread.authorize(creds)
+
+def ws(name: str):
+    sh = gs_client().open_by_key(st.secrets["app"]["sheet_id"])
+    return sh.worksheet(name)
+
+def read_df(sheet_name: str) -> pd.DataFrame:
+    w = ws(sheet_name)
+    values = w.get_all_values()
+    if not values:
+        return pd.DataFrame()
+    header = values[0]
+    rows = values[1:]
+    return pd.DataFrame(rows, columns=header)
+
+def overwrite_df(sheet_name: str, df: pd.DataFrame):
+    w = ws(sheet_name)
+    w.clear()
+    if df is None or df.empty:
+        return
+    w.update([df.columns.tolist()] + df.astype(str).fillna("").values.tolist())
 # =========================================================
 # Config
 # =========================================================
