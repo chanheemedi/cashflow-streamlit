@@ -9,19 +9,38 @@ import calendar
 import math
 import openpyxl
 
+# Google Sheets
 import gspread
 from google.oauth2.service_account import Credentials
 
 # =========================================================
-# Google Sheets DB helpers
+# Config
 # =========================================================
+EXCLUDED_ACCOUNT_NAMES = {"신한_에셀", "하나_꾸러기건식"}  # 병원 범위에서 제외
+INTERNAL_WINDOW = timedelta(hours=2)
+
+DEFAULT_DRAWDOWN_KEYWORDS = ["메디컬네트워크론"]
+PRINCIPAL_KEYWORDS = ["메디칼론원금"]
+INTEREST_KEYWORDS = ["메디칼론이자"]
+
+DOW_KO = ["월", "화", "수", "목", "금", "토", "일"]
+
 st.set_page_config(page_title="현금흐름 MVP", layout="wide")
+
+# =========================================================
+# DB (Google Sheets) helpers
+# =========================================================
+def _normalize_sheet_id(x: str) -> str:
+    s = str(x).strip()
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", s)
+    if m:
+        return m.group(1)
+    s = s.split("/edit")[0]
+    return s
 
 def _db_enabled() -> bool:
     try:
-        _ = st.secrets["app"]["sheet_id"]
-        _ = st.secrets["gcp_service_account"]["client_email"]
-        return True
+        return ("gcp_service_account" in st.secrets) and ("app" in st.secrets) and ("sheet_id" in st.secrets["app"])
     except Exception:
         return False
 
@@ -29,14 +48,23 @@ DB_ENABLED = _db_enabled()
 
 @st.cache_resource
 def gs_client():
+    info = dict(st.secrets["gcp_service_account"])
+    # secrets에 \n 텍스트로 들어와도 실제 개행으로 변환
+    if "private_key" in info and isinstance(info["private_key"], str):
+        info["private_key"] = info["private_key"].replace("\\n", "\n")
+
     creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"],
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        info,
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
     )
     return gspread.authorize(creds)
 
 def ws(name: str):
-    sh = gs_client().open_by_key(st.secrets["app"]["sheet_id"])
+    sheet_id = _normalize_sheet_id(st.secrets["app"]["sheet_id"])
+    sh = gs_client().open_by_key(sheet_id)
     return sh.worksheet(name)
 
 def read_df(sheet_name: str) -> pd.DataFrame:
@@ -50,9 +78,8 @@ def read_df(sheet_name: str) -> pd.DataFrame:
     rows = values[1:]
     df = pd.DataFrame(rows, columns=header)
 
-    # ✅ 완전 빈 줄 제거(모든 컬럼이 공백)
-    df = df.replace("", np.nan)
-    df = df.dropna(how="all").fillna("")
+    # 완전 빈 줄 제거
+    df = df.replace("", np.nan).dropna(how="all").fillna("")
     return df
 
 def overwrite_df(sheet_name: str, df: pd.DataFrame):
@@ -61,115 +88,9 @@ def overwrite_df(sheet_name: str, df: pd.DataFrame):
     w = ws(sheet_name)
     w.clear()
     if df is None or df.empty:
+        # 헤더만이라도 유지하려면 필요시 여기에서 처리 가능
         return
     w.update([df.columns.tolist()] + df.astype(str).fillna("").values.tolist())
-
-def _now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-def load_internal_decisions() -> dict:
-    """{(out_tx_id, in_tx_id): status}"""
-    df = read_df("internal_transfers")
-    if df.empty:
-        return {}
-    # 빈줄 제거
-    df = df[(df["out_tx_id"].astype(str).str.strip() != "") & (df["in_tx_id"].astype(str).str.strip() != "")]
-    d = {}
-    for _, r in df.iterrows():
-        key = (str(r["out_tx_id"]).strip(), str(r["in_tx_id"]).strip())
-        status = str(r.get("status", "")).strip().upper() or "CONFIRMED"
-        d[key] = status
-    return d
-
-def upsert_internal_decisions(changes: dict, note_map: dict | None = None):
-    """
-    changes: {(out_tx_id,in_tx_id): "CONFIRMED"/"REJECTED"}
-    note_map(optional): {(out_tx_id,in_tx_id): "메모"}
-    """
-    base = read_df("internal_transfers")
-    if base.empty:
-        base = pd.DataFrame(columns=["out_tx_id","in_tx_id","status","updated_at","note"])
-    else:
-        base = base[(base["out_tx_id"].astype(str).str.strip() != "") & (base["in_tx_id"].astype(str).str.strip() != "")].copy()
-
-    now = _now_str()
-    idx = {(str(r["out_tx_id"]).strip(), str(r["in_tx_id"]).strip()): i for i, r in base.iterrows()}
-
-    for key, status in changes.items():
-        o, i = key
-        status = str(status).strip().upper()
-        note = ""
-        if note_map and key in note_map:
-            note = str(note_map[key])
-
-        if key in idx:
-            row_i = idx[key]
-            base.loc[row_i, "status"] = status
-            base.loc[row_i, "updated_at"] = now
-            if note != "":
-                base.loc[row_i, "note"] = note
-        else:
-            base = pd.concat([base, pd.DataFrame([{
-                "out_tx_id": o,
-                "in_tx_id": i,
-                "status": status,
-                "updated_at": now,
-                "note": note
-            }])], ignore_index=True)
-
-    overwrite_df("internal_transfers", base)
-
-def load_plans(month_key: str) -> pd.DataFrame:
-    df = read_df("plans")
-    if df.empty:
-        return pd.DataFrame(columns=["date","direction","amount","label"])
-    df = df[df["month_key"].astype(str) == str(month_key)].copy()
-
-    for c in ["date","direction","amount","label"]:
-        if c not in df.columns:
-            df[c] = ""
-
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(int)
-    # date를 date 객체로 변환(가능한 경우)
-    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
-    df["direction"] = df["direction"].astype(str)
-
-    out = df[["date","direction","amount","label"]].copy()
-    return out
-
-def save_plans_month(month_key: str, plan_df: pd.DataFrame):
-    base = read_df("plans")
-    if base.empty:
-        base = pd.DataFrame(columns=["date","direction","amount","label","month_key","updated_at"])
-    else:
-        base = base[base["month_key"].astype(str) != str(month_key)].copy()
-
-    now = _now_str()
-    out = plan_df.copy()
-
-    # 저장형식 정리
-    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    out["direction"] = out["direction"].astype(str)
-    out["amount"] = pd.to_numeric(out["amount"], errors="coerce").fillna(0).astype(int)
-    out["label"] = out["label"].astype(str)
-
-    out["month_key"] = month_key
-    out["updated_at"] = now
-
-    merged = pd.concat([base, out], ignore_index=True)
-    overwrite_df("plans", merged)
-
-# =========================================================
-# Config
-# =========================================================
-EXCLUDED_ACCOUNT_NAMES = {"신한_에셀", "하나_꾸러기건식"}  # 병원 범위에서 제외
-INTERNAL_WINDOW = timedelta(hours=2)
-
-DEFAULT_DRAWDOWN_KEYWORDS = ["메디컬네트워크론"]
-PRINCIPAL_KEYWORDS = ["메디칼론원금"]
-INTEREST_KEYWORDS = ["메디칼론이자"]
-
-DOW_KO = ["월", "화", "수", "목", "금", "토", "일"]
 
 # =========================================================
 # Display helpers
@@ -251,6 +172,7 @@ def parse_template_cashflow(file_bytes: bytes) -> pd.DataFrame:
     df["amount"] = df["amount"].astype(int)
 
     df["direction"] = np.where(df["입/출"].astype(str).str.startswith("출금"), "OUT", "IN")
+
     df["account_name"] = df["계좌명"].astype(str)
     df["counterparty"] = df["입금처(출금처)"].astype(str)
 
@@ -263,6 +185,7 @@ def parse_template_cashflow(file_bytes: bytes) -> pd.DataFrame:
     df["is_drawdown"] = False
 
     df["subtype"] = np.where(df["입/출"].astype(str).str.contains("청구"), "CLAIM", "NORMAL")
+
     df["is_internal_auto"] = df["거래처코드"].astype(str).eq("자금이동")
 
     df["tx_id"] = df.apply(
@@ -427,6 +350,9 @@ def parse_any_excel(file_bytes: bytes) -> tuple[pd.DataFrame, dict | None]:
 # Internal transfer matching
 # =========================================================
 def build_internal_candidates(tx: pd.DataFrame) -> pd.DataFrame:
+    if tx is None or tx.empty:
+        return pd.DataFrame()
+
     base = tx[
         (~tx["is_excluded_account"]) &
         (~tx["is_principal"]) &
@@ -501,7 +427,7 @@ def compute_anchor_cash_from_bank_and_tx(tx: pd.DataFrame, anchor: dict) -> tupl
     for acct in hospital_accounts:
         v = bank_bal.get(acct)
         if v is None or (isinstance(v, float) and math.isnan(v)):
-            g = tx[tx["account_name"] == acct]
+            g = tx[tx["account_name"] == acct] if tx is not None else pd.DataFrame()
             inferred = balance_at_time_for_account(g, cash_time) if len(g) else None
             if inferred is None:
                 missing.append(acct)
@@ -514,6 +440,9 @@ def compute_anchor_cash_from_bank_and_tx(tx: pd.DataFrame, anchor: dict) -> tupl
 
 def cash_balance_from_anchor(tx: pd.DataFrame, anchor_time: pd.Timestamp, anchor_cash: float, target_time: pd.Timestamp,
                             confirmed_pairs: set[tuple[str,str]]) -> float:
+    if tx is None or tx.empty:
+        return float(anchor_cash)
+
     confirmed_out = {p[0] for p in confirmed_pairs}
     confirmed_in = {p[1] for p in confirmed_pairs}
     excluded_ids = confirmed_out.union(confirmed_in)
@@ -529,6 +458,9 @@ def cash_balance_from_anchor(tx: pd.DataFrame, anchor_time: pd.Timestamp, anchor
 
 def loan_avail_from_anchor(tx: pd.DataFrame, anchor_time: pd.Timestamp, anchor_loan_avail: float, target_time: pd.Timestamp,
                            drawdown_keywords: list[str]) -> float:
+    if tx is None or tx.empty:
+        return float(anchor_loan_avail)
+
     base = tx[~tx["is_excluded_account"]].copy()
     mask = (base["posted_at"] > target_time) & (base["posted_at"] <= anchor_time)
     seg = base.loc[mask, ["direction","amount","counterparty","is_principal"]].copy()
@@ -547,6 +479,12 @@ def loan_avail_from_anchor(tx: pd.DataFrame, anchor_time: pd.Timestamp, anchor_l
     return float(anchor_loan_avail) - net
 
 def daily_aggregations(tx: pd.DataFrame, confirmed_pairs: set[tuple[str,str]], drawdown_keywords: list[str]) -> pd.DataFrame:
+    if tx is None or tx.empty:
+        return pd.DataFrame(columns=[
+            "biz_date","actual_in_claim","actual_in","actual_out_oper","principal","interest",
+            "drawdown","loan_delta","total_in","total_out_cash","cash_net"
+        ])
+
     confirmed_out = {p[0] for p in confirmed_pairs}
     confirmed_in = {p[1] for p in confirmed_pairs}
     excluded_ids = confirmed_out.union(confirmed_in)
@@ -597,9 +535,9 @@ def build_month_table(tx: pd.DataFrame, plan_df: pd.DataFrame, year: int, month:
     first, last = month_range(year, month)
     days = pd.date_range(first, last, freq="D")
 
-    if plan_df is None or len(plan_df) == 0:
-        plan_map = {}
-    else:
+    # 계획(예정) -> 일자 합산 map
+    plan_map = {}
+    if plan_df is not None and len(plan_df) > 0:
         p = plan_df.copy()
         p["biz_date"] = pd.to_datetime(p["date"], errors="coerce").dt.date
         p = p[p["biz_date"].notna()].copy()
@@ -609,11 +547,13 @@ def build_month_table(tx: pd.DataFrame, plan_df: pd.DataFrame, year: int, month:
         p["plan_out"] = np.where(p["direction"]=="OUT", p["amount"], 0)
         plan_map = p.groupby("biz_date").agg(plan_in=("plan_in","sum"), plan_out=("plan_out","sum")).to_dict("index")
 
+    # 실제 집계
     daily = daily_aggregations(tx, confirmed_pairs, drawdown_keywords)
-    daily_map = daily.set_index("biz_date").to_dict("index")
+    daily_map = daily.set_index("biz_date").to_dict("index") if len(daily) else {}
 
     rows = []
 
+    # 앵커 기반 시작값
     if anchor_info is not None:
         anchor_time = anchor_info["anchor_time"]
         anchor_cash = anchor_info["anchor_cash"]
@@ -678,20 +618,78 @@ def build_month_table(tx: pd.DataFrame, plan_df: pd.DataFrame, year: int, month:
     return pd.DataFrame(rows)
 
 # =========================================================
+# Plans DB (load/save)
+# =========================================================
+def _ensure_plan_cols(df: pd.DataFrame) -> pd.DataFrame:
+    base_cols = ["date","direction","amount","label","month_key","updated_at"]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=base_cols)
+    for c in base_cols:
+        if c not in df.columns:
+            df[c] = ""
+    return df[base_cols].copy()
+
+def load_plans_month(year: int, month: int) -> pd.DataFrame:
+    df = _ensure_plan_cols(read_df("plans")) if DB_ENABLED else _ensure_plan_cols(pd.DataFrame())
+    mk = f"{year}-{month:02d}"
+    if len(df) == 0:
+        return _ensure_plan_cols(pd.DataFrame())
+    out = df[df["month_key"].astype(str).eq(mk)].copy()
+
+    # 타입 정리
+    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.date.astype("object")
+    out["direction"] = out["direction"].astype(str).replace({"입금":"IN","출금":"OUT"})
+    out["amount"] = pd.to_numeric(out["amount"], errors="coerce").fillna(0).astype(int)
+    out["label"] = out["label"].astype(str)
+    out["month_key"] = mk
+    return _ensure_plan_cols(out)
+
+def save_plans_month(year: int, month: int, edited: pd.DataFrame):
+    if not DB_ENABLED:
+        return
+
+    mk = f"{year}-{month:02d}"
+    all_df = _ensure_plan_cols(read_df("plans"))
+    # 기존 월 데이터 제거 후 덮어쓰기
+    all_df = all_df[~all_df["month_key"].astype(str).eq(mk)].copy()
+
+    e = edited.copy() if edited is not None else pd.DataFrame(columns=["date","direction","amount","label"])
+    if len(e) > 0:
+        e = e.copy()
+        e["date"] = pd.to_datetime(e["date"], errors="coerce").dt.date.astype("object")
+        e = e[e["date"].notna()].copy()
+        e["direction"] = e["direction"].astype(str).str.upper().replace({"입금":"IN","출금":"OUT"})
+        e["amount"] = pd.to_numeric(e["amount"], errors="coerce").fillna(0).astype(int)
+        e["label"] = e.get("label","").astype(str)
+        e["month_key"] = mk
+        e["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        e = _ensure_plan_cols(e)
+        all_df = pd.concat([all_df, e], ignore_index=True)
+
+    overwrite_df("plans", all_df)
+
+# =========================================================
 # UI
 # =========================================================
 st.title("현금흐름 MVP (업로드 → 내부이동 자동검수(DB) → 월수입지출/가용금액(DB 예정))")
 
+# ---- sidebar DB status + navigation
 st.sidebar.header("DB 상태")
 if DB_ENABLED:
     try:
-        _t = read_df("internal_transfers")
-        _p = read_df("plans")
-        st.sidebar.success(f"Google Sheets 연결 OK\n- internal_transfers: {len(_t)} rows\n- plans: {len(_p)} rows")
+        _ = gs_client()  # ensure auth
+        st.sidebar.success("Google Sheets 연결 OK")
+        it_df = read_df("internal_transfers")
+        pl_df = read_df("plans")
+        st.sidebar.write(f"• internal_transfers: {len(it_df):,} rows")
+        st.sidebar.write(f"• plans: {len(pl_df):,} rows")
     except Exception as e:
         st.sidebar.error(f"Google Sheets 연결 실패: {e}")
+        DB_ENABLED = False
 else:
-    st.sidebar.warning("Secrets 미설정 → DB 비활성 (세션 저장만 동작)")
+    st.sidebar.info("DB 미사용(Secrets 설정 필요)")
+
+page = st.sidebar.radio("페이지", ["월수입지출(핵심)", "내부이동 검수", "일자별 요약", "원장(거래 목록)"])
 
 st.sidebar.header("데이터 업로드")
 files = st.sidebar.file_uploader(
@@ -700,10 +698,6 @@ files = st.sidebar.file_uploader(
     accept_multiple_files=True
 )
 
-if not files:
-    st.info("좌측에서 엑셀 파일을 업로드하세요.")
-    st.stop()
-
 st.sidebar.subheader("메디칼론 대출사용(인출) 키워드")
 dd_kw_text = st.sidebar.text_input(
     "입금처(출금처)에 포함된 키워드(콤마로 구분)",
@@ -711,46 +705,43 @@ dd_kw_text = st.sidebar.text_input(
 )
 drawdown_keywords = [x.strip() for x in dd_kw_text.split(",") if x.strip()]
 
-all_tx = []
+# ---- If no files, still render wireframe pages using empty tx
+tx = pd.DataFrame(columns=[
+    "tx_id","posted_at","biz_date","account_name","direction","subtype","amount",
+    "counterparty","balance","is_excluded_account","is_internal_auto",
+    "is_principal","is_interest","is_drawdown","source","file_name"
+])
 anchors = []
 parse_errors = []
 
-for f in files:
-    b = f.getvalue()
-    try:
-        tx_one, anchor = parse_any_excel(b)
-        tx_one["file_name"] = f.name
-        all_tx.append(tx_one)
-        if anchor is not None:
-            anchors.append(anchor)
-    except Exception as e:
-        parse_errors.append((f.name, str(e)))
+if files:
+    all_tx = []
+    for f in files:
+        b = f.getvalue()
+        try:
+            tx_one, anchor = parse_any_excel(b)
+            tx_one["file_name"] = f.name
+            all_tx.append(tx_one)
+            if anchor is not None:
+                anchors.append(anchor)
+        except Exception as e:
+            parse_errors.append((f.name, str(e)))
 
-if parse_errors:
-    st.error("일부 파일 파싱 실패")
-    for fn, msg in parse_errors:
-        st.write(f"- {fn}: {msg}")
-    st.stop()
+    if parse_errors:
+        st.error("일부 파일 파싱 실패")
+        for fn, msg in parse_errors:
+            st.write(f"- {fn}: {msg}")
 
-tx = pd.concat(all_tx, ignore_index=True).drop_duplicates(subset=["tx_id"])
-tx = tx.sort_values("posted_at")
+    if all_tx:
+        tx = pd.concat(all_tx, ignore_index=True).drop_duplicates(subset=["tx_id"]).sort_values("posted_at")
 
-min_dt = tx["posted_at"].min()
-max_dt = tx["posted_at"].max()
-
-# ---- load internal decisions from DB (once)
-if "it_db_decisions" not in st.session_state:
-    st.session_state.it_db_decisions = load_internal_decisions() if DB_ENABLED else {}
-if "it_working_decisions" not in st.session_state:
-    st.session_state.it_working_decisions = dict(st.session_state.it_db_decisions)
-
-# confirmed_pairs = CONFIRMED인 내부이체
+# ---- session state
 if "confirmed_pairs" not in st.session_state:
-    st.session_state.confirmed_pairs = {k for k,v in st.session_state.it_working_decisions.items() if v != "REJECTED"}
+    st.session_state.confirmed_pairs = set()
 
 # ---- anchor resolution
 anchor_info = None
-if anchors:
+if anchors and not tx.empty:
     anchors_sorted = sorted(anchors, key=lambda a: a["loan_time"])
     a = anchors_sorted[-1]
 
@@ -758,6 +749,7 @@ if anchors:
 
     cash_time = a["cash_time"]
     loan_time = a["loan_time"]
+
     base = tx[~tx["is_excluded_account"]].copy()
     seg = base[(base["posted_at"] > cash_time) & (base["posted_at"] <= loan_time)].copy()
     seg["cash_delta"] = np.where(seg["direction"]=="IN", seg["amount"], -seg["amount"])
@@ -773,216 +765,84 @@ if anchors:
         "loan_time": loan_time,
     }
 
-# ---- top metrics
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("거래기간", f"{min_dt} ~ {max_dt}")
-c2.metric("전체 거래(중복제거)", f"{len(tx):,}")
-c3.metric("제외계좌 건수", f"{int(tx['is_excluded_account'].sum()):,}")
-c4.metric("내부이체(확정: DB/세션)", f"{len(st.session_state.confirmed_pairs):,}쌍")
-
-page = st.sidebar.radio("페이지", ["월수입지출(핵심)", "내부이동 검수(DB)", "일자별 요약", "원장(거래 목록)"])
+# =========================================================
+# Top: summary banner
+# =========================================================
+with st.container():
+    left, right = st.columns([3,7])
+    with left:
+        if not tx.empty:
+            min_dt = tx["posted_at"].min()
+            max_dt = tx["posted_at"].max()
+            st.metric("거래기간", f"{min_dt} ~ {max_dt}")
+            st.metric("전체 거래(중복제거)", f"{len(tx):,}")
+        else:
+            st.info("아직 거래 파일이 업로드되지 않았어요. (예정 DB만으로 월말 예측 와이어프레임을 볼 수 있습니다.)")
+    with right:
+        if anchor_info is not None:
+            cash = anchor_info["anchor_cash"]
+            loan_av = anchor_info["anchor_loan_avail"]
+            total = cash + loan_av
+            c1, c2, c3 = st.columns(3)
+            c1.metric("현금(병원 범위, 앵커)", fmt_int(cash))
+            c2.metric("메디칼론 여유액(앵커)", fmt_int(loan_av))
+            c3.metric("Total 가용금액(앵커)", fmt_int(total))
+        else:
+            st.caption("앵커(계좌별잔액+메디칼론한도여유액)를 포함한 파일을 업로드하면 가용금액 정합이 활성화됩니다.")
 
 # =========================================================
-# Page: Internal transfer review (DB)
+# Page: Monthly core
 # =========================================================
-if page == "내부이동 검수(DB)":
-    st.header("내부이체 자동검수 (기본=확정 / 예외만 해제 후 DB 저장)")
-    cand = build_internal_candidates(tx)
-
-    top1, top2, top3 = st.columns([2,2,6])
-    with top1:
-        hide_rejected = st.checkbox("REJECTED 숨김", value=True)
-    with top2:
-        if st.button("DB에서 새로고침"):
-            st.session_state.it_db_decisions = load_internal_decisions() if DB_ENABLED else {}
-            st.session_state.it_working_decisions = dict(st.session_state.it_db_decisions)
-            st.session_state.confirmed_pairs = {k for k,v in st.session_state.it_working_decisions.items() if v != "REJECTED"}
-            st.success("새로고침 완료")
-            st.rerun()
-    with top3:
-        st.caption("체크 ON=내부이체 확정(CONFIRMED), 체크 OFF=예외(REJECTED). 저장하면 이후에는 자동으로 반영됩니다.")
-
-    if cand.empty:
-        st.info("내부이체 후보가 없습니다.")
-    else:
-        st.write(f"후보 {len(cand):,}쌍")
-
-        # 화면 렌더링 전에 working decisions를 최신화
-        working = st.session_state.it_working_decisions
-
-        shown = 0
-        for _, r in cand.sort_values("time_diff_seconds").iterrows():
-            key = (r["out_tx_id"], r["in_tx_id"])
-            status = working.get(key, "CONFIRMED")  # 기본 확정
-            if hide_rejected and status == "REJECTED":
-                continue
-
-            shown += 1
-            left, mid, right = st.columns([7,7,3])
-
-            with left:
-                st.markdown(f"**OUT** {r['out_time']} / {r['out_account']} / {fmt_int(r['amount'])}")
-                if r.get("out_counterparty"):
-                    st.caption(f"{r['out_counterparty']}")
-            with mid:
-                st.markdown(f"**IN**  {r['in_time']} / {r['in_account']} / {fmt_int(r['amount'])}")
-                if r.get("in_counterparty"):
-                    st.caption(f"{r['in_counterparty']}")
-                st.caption(f"time diff: {int(r['time_diff_seconds'])}s")
-
-            with right:
-                checked = st.checkbox(
-                    "내부이체(확정)",
-                    value=(status != "REJECTED"),
-                    key=f"it_{r['out_tx_id']}_{r['in_tx_id']}"
-                )
-                new_status = "CONFIRMED" if checked else "REJECTED"
-                working[key] = new_status
-
-        st.session_state.it_working_decisions = working
-        st.session_state.confirmed_pairs = {k for k,v in working.items() if v != "REJECTED"}
-
-        st.divider()
-        save_col1, save_col2 = st.columns([2,8])
-        with save_col1:
-            if st.button("내부이체 결정 DB 저장", disabled=(not DB_ENABLED)):
-                before = st.session_state.it_db_decisions
-                after = st.session_state.it_working_decisions
-
-                diff = {}
-                for k, v in after.items():
-                    if before.get(k, None) != v:
-                        diff[k] = v
-
-                if not diff:
-                    st.info("변경사항이 없습니다.")
-                else:
-                    upsert_internal_decisions(diff)
-                    st.session_state.it_db_decisions = load_internal_decisions()
-                    st.session_state.it_working_decisions = dict(st.session_state.it_db_decisions)
-                    st.session_state.confirmed_pairs = {k for k,v in st.session_state.it_working_decisions.items() if v != "REJECTED"}
-                    st.success(f"저장 완료 ({len(diff)}건 변경)")
-                    st.rerun()
-
-        with save_col2:
-            st.caption(f"현재 화면 표시: {shown}쌍 / 확정 내부이체: {len(st.session_state.confirmed_pairs)}쌍")
-
-# =========================================================
-# Page: Daily summary
-# =========================================================
-elif page == "일자별 요약":
-    st.header("일자별 요약")
-    daily = daily_aggregations(tx, st.session_state.confirmed_pairs, drawdown_keywords).sort_values("biz_date")
-
-    if daily.empty:
-        st.info("데이터가 없습니다.")
-    else:
-        disp = daily.copy()
-        disp["날짜"] = disp["biz_date"].astype(str)
-        for col in ["actual_in_claim","actual_in","actual_out_oper","principal","interest","drawdown","loan_delta","cash_net"]:
-            disp[col] = disp[col].map(fmt_int)
-        st.dataframe(
-            disp[["날짜","actual_in_claim","actual_in","actual_out_oper","principal","interest","drawdown","loan_delta","cash_net"]],
-            use_container_width=True,
-            hide_index=True
-        )
-
-# =========================================================
-# Page: Monthly cashflow core + Plans DB
-# =========================================================
-elif page == "월수입지출(핵심)":
+if page == "월수입지출(핵심)":
     st.header("월수입지출 (현금 + 메디칼론 + Total 가용금액)")
 
-    if anchor_info is not None:
-        cash = anchor_info["anchor_cash"]
-        loan_av = anchor_info["anchor_loan_avail"]
-        total = cash + loan_av
-
-        b1, b2, b3, b4 = st.columns(4)
-        b1.metric("앵커 시점", str(anchor_info["anchor_time"]))
-        b2.metric("현금(병원 범위)", fmt_int(cash))
-        b3.metric("메디칼론 여유액", fmt_int(loan_av))
-        b4.metric("Total 가용금액", fmt_int(total))
-
-        if anchor_info["missing_accounts"]:
-            st.warning(f"계좌별 잔액에서 공란(자동 0 처리)된 계좌: {', '.join(anchor_info['missing_accounts'])}")
+    # month selector
+    today = date.today()
+    if not tx.empty:
+        months = sorted({(d.year, d.month) for d in pd.to_datetime(tx["biz_date"]).dropna().dt.to_pydatetime()})
+        if not months:
+            months = [(today.year, today.month)]
     else:
-        st.info("잔액정렬data.xlsx(계좌별 잔액 + 메디칼론한도여유액 + rawdata)가 업로드되면 앵커 기반 정합이 자동으로 활성화됩니다.")
-
-    months = sorted({(d.year, d.month) for d in pd.to_datetime(tx["biz_date"]).dt.to_pydatetime()})
+        months = [(today.year, today.month)]
     month_labels = [f"{y}-{m:02d}" for y,m in months]
-    sel = st.selectbox("월 선택", month_labels, index=len(month_labels)-1 if month_labels else 0)
+    sel = st.selectbox("월 선택", month_labels, index=len(month_labels)-1)
     year, month = map(int, sel.split("-"))
-    month_key = f"{year}-{month:02d}"
 
-    # ----- load plans from DB when month changes
-    if "plan_month_key" not in st.session_state or st.session_state.plan_month_key != month_key:
-        if DB_ENABLED:
-            st.session_state.plan_df = load_plans(month_key)
-        else:
-            st.session_state.plan_df = pd.DataFrame(columns=["date","direction","amount","label"])
-        st.session_state.plan_month_key = month_key
+    # manual anchor when no anchor_info
+    if anchor_info is None:
+        st.subheader("앵커 수동 입력(거래 업로드 전 와이어프레임용)")
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            manual_cash = st.number_input("월초 현금(병원 범위)", value=0, step=1000000)
+        with m2:
+            manual_loan = st.number_input("월초 메디칼론 여유액", value=0, step=1000000)
+        with m3:
+            st.metric("월초 Total 가용금액", fmt_int(manual_cash + manual_loan))
+        # anchor_info를 “월초값 기준”으로 임시 구성(테이블 계산용)
+        anchor_info_eff = {
+            "anchor_time": pd.Timestamp(datetime.combine(date(year, month, 1), datetime.min.time())),
+            "anchor_cash": float(manual_cash),
+            "anchor_loan_avail": float(manual_loan),
+            "missing_accounts": [],
+            "cash_time": pd.Timestamp(datetime.combine(date(year, month, 1), datetime.min.time())),
+            "loan_time": pd.Timestamp(datetime.combine(date(year, month, 1), datetime.min.time())),
+        }
+    else:
+        anchor_info_eff = anchor_info
 
-    # ----- Plan editing UI: dialog per date
-    st.subheader("예정 입력 (DB 저장)")
+    # DB plans load
+    st.subheader("예정 입력 (DB 저장/불러오기)")
+    if "plan_df" not in st.session_state or st.session_state.get("plan_month_key") != f"{year}-{month:02d}":
+        st.session_state.plan_df = load_plans_month(year, month) if DB_ENABLED else pd.DataFrame(columns=["date","direction","amount","label","month_key","updated_at"])
+        st.session_state.plan_month_key = f"{year}-{month:02d}"
 
-    topa, topb, topc = st.columns([2,2,6])
-    with topa:
-        edit_date = st.date_input("예정 편집할 날짜", value=month_range(year, month)[0])
-    with topb:
-        use_dialog = hasattr(st, "dialog")
-        if st.button("해당일 예정 편집(팝업)") and use_dialog:
-            @st.dialog("해당일 예정 편집")
-            def _edit_plan_dialog(d: date):
-                df = st.session_state.plan_df.copy()
-                df["_d"] = pd.to_datetime(df["date"], errors="coerce").dt.date
-                d_str = d.strftime("%Y-%m-%d")
+    # editor columns to show
+    editable = st.session_state.plan_df.copy()
+    # 편집에서는 month_key/updated_at 숨기고 핵심 4개만
+    edit_view = editable[["date","direction","amount","label"]].copy()
 
-                day_rows = df[df["_d"] == d].drop(columns=["_d"]).copy()
-                if day_rows.empty:
-                    day_rows = pd.DataFrame([{"date": d, "direction": "OUT", "amount": 0, "label": ""}])
-
-                edited = st.data_editor(
-                    day_rows,
-                    use_container_width=True,
-                    num_rows="dynamic",
-                    column_config={
-                        "date": st.column_config.DateColumn("날짜"),
-                        "direction": st.column_config.SelectboxColumn("구분", options=["IN","OUT","입금","출금"]),
-                        "amount": st.column_config.NumberColumn("금액"),
-                        "label": st.column_config.TextColumn("항목/메모"),
-                    }
-                )
-
-                c1, c2 = st.columns(2)
-                with c1:
-                    if st.button("저장"):
-                        # 기존 날짜 제거 후 대체
-                        base_df = st.session_state.plan_df.copy()
-                        base_df["_d"] = pd.to_datetime(base_df["date"], errors="coerce").dt.date
-                        base_df = base_df[base_df["_d"] != d].drop(columns=["_d"]).copy()
-
-                        new_df = pd.concat([base_df, edited], ignore_index=True)
-                        # normalize direction
-                        new_df["direction"] = new_df["direction"].astype(str).str.upper().replace({"입금":"IN","출금":"OUT"})
-                        st.session_state.plan_df = new_df
-
-                        if DB_ENABLED:
-                            save_plans_month(st.session_state.plan_month_key, st.session_state.plan_df)
-                        st.success("저장 완료")
-                        st.rerun()
-                with c2:
-                    st.caption(f"{d_str} 라인아이템을 편집 후 저장하세요.")
-
-            _edit_plan_dialog(edit_date)
-        elif (not use_dialog):
-            st.caption("현재 Streamlit 버전에 dialog가 없어 팝업 편집이 비활성입니다. 아래 전체 편집을 사용하세요.")
-    with topc:
-        st.caption("팝업에서 해당 날짜만 빠르게 수정할 수 있습니다. (월 전체 편집도 아래에서 가능)")
-
-    # ----- Full month plan editor
-    st.session_state.plan_df = st.data_editor(
-        st.session_state.plan_df,
+    edit_view = st.data_editor(
+        edit_view,
         use_container_width=True,
         num_rows="dynamic",
         column_config={
@@ -990,64 +850,85 @@ elif page == "월수입지출(핵심)":
             "direction": st.column_config.SelectboxColumn("구분", options=["IN","OUT","입금","출금"]),
             "amount": st.column_config.NumberColumn("금액"),
             "label": st.column_config.TextColumn("항목/메모"),
-        }
+        },
+        key="plan_editor",
     )
 
-    savep1, savep2 = st.columns([2,8])
-    with savep1:
-        if st.button("이번달 예정 DB 저장", disabled=(not DB_ENABLED)):
-            # normalize
-            dfp = st.session_state.plan_df.copy()
-            dfp["direction"] = dfp["direction"].astype(str).str.upper().replace({"입금":"IN","출금":"OUT"})
-            st.session_state.plan_df = dfp
-            save_plans_month(month_key, st.session_state.plan_df)
-            st.success("저장 완료")
-    with savep2:
-        if DB_ENABLED:
-            st.caption("저장하면 다음 접속/다른 사람 접속에서도 동일하게 유지됩니다.")
+    b_save, b_reload, b_export = st.columns([2,2,2])
+    with b_save:
+        if st.button("이번달 예정 DB 저장", use_container_width=True, disabled=(not DB_ENABLED)):
+            save_plans_month(year, month, edit_view)
+            st.success("저장 완료(구글시트 plans 반영).")
+            st.session_state.plan_df = load_plans_month(year, month)
+    with b_reload:
+        if st.button("DB에서 다시 불러오기", use_container_width=True, disabled=(not DB_ENABLED)):
+            st.session_state.plan_df = load_plans_month(year, month)
+            st.success("불러오기 완료.")
+    with b_export:
+        st.download_button(
+            "예정 CSV 다운로드",
+            data=edit_view.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"plans_{year}-{month:02d}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
 
-    # ----- Build table
+    # build month table
     table = build_month_table(
         tx=tx,
-        plan_df=st.session_state.plan_df,
+        plan_df=edit_view,
         year=year,
         month=month,
-        anchor_info=anchor_info,
+        anchor_info=anchor_info_eff,
         confirmed_pairs=st.session_state.confirmed_pairs,
         drawdown_keywords=drawdown_keywords
     )
 
-    # month end quick summary
-    if not table.empty:
-        last_row = table.iloc[-1]
-        s1, s2, s3 = st.columns(3)
-        s1.metric("월말 현금(예상)", fmt_int(last_row["cash_end"]))
-        s2.metric("월말 메디칼론 여유액(예상)", fmt_int(last_row["loan_avail_end"]))
-        s3.metric("월말 Total 가용금액(예상)", fmt_int(last_row["total_end"]))
+    # headline projections
+    last_row = table.iloc[-1] if len(table) else None
+    if last_row is not None:
+        p1, p2, p3 = st.columns(3)
+        p1.metric("월말 예상 현금", fmt_int(last_row["cash_end"]))
+        p2.metric("월말 예상 메디칼론 여유액", fmt_int(last_row["loan_avail_end"]))
+        p3.metric("월말 예상 Total", fmt_int(last_row["total_end"]))
 
-    st.subheader("일자별 롤링표 (현금/메디칼론/Total)")
+    st.subheader("일자별 롤링표 (가독성 중심)")
     disp = table.copy()
     disp["날짜"] = disp["date"].astype(str)
     disp["요일"] = disp["dow"]
 
     num_cols = [
-        "cash_start","loan_avail_start","total_start",
-        "actual_in_claim","actual_in","actual_out_oper","principal","interest","drawdown","plan_in","plan_out",
-        "cash_change","loan_change","total_change",
-        "cash_end","loan_avail_end","total_end"
-    ]
-    for c in num_cols:
-        disp[c] = disp[c].map(fmt_int)
-
-    show_cols = [
-        "날짜","요일",
-        "cash_start","loan_avail_start","total_start",
+        "total_start",
         "actual_in_claim","actual_in","actual_out_oper","principal","interest","drawdown",
         "plan_in","plan_out",
-        "cash_change","loan_change","total_change",
-        "cash_end","loan_avail_end","total_end"
+        "total_change",
+        "total_end",
     ]
-    st.dataframe(disp[show_cols], use_container_width=True, hide_index=True)
+    # 표는 “핵심만” 먼저 보여주고, 상세는 expander로
+    core_cols = ["날짜","요일"] + num_cols
+
+    for c in core_cols:
+        if c in disp.columns and c not in ["날짜","요일"]:
+            disp[c] = disp[c].map(fmt_int)
+
+    st.dataframe(disp[core_cols], use_container_width=True, hide_index=True)
+
+    with st.expander("상세 컬럼 보기(현금/메디칼론 포함)"):
+        disp2 = table.copy()
+        disp2["날짜"] = disp2["date"].astype(str)
+        disp2["요일"] = disp2["dow"]
+        show_cols = [
+            "날짜","요일",
+            "cash_start","loan_avail_start","total_start",
+            "actual_in_claim","actual_in","actual_out_oper","principal","interest","drawdown",
+            "plan_in","plan_out",
+            "cash_change","loan_change","total_change",
+            "cash_end","loan_avail_end","total_end"
+        ]
+        for c in show_cols:
+            if c not in ["날짜","요일"]:
+                disp2[c] = disp2[c].map(fmt_int)
+        st.dataframe(disp2[show_cols], use_container_width=True, hide_index=True)
 
     st.download_button(
         "월수입지출 CSV 다운로드",
@@ -1056,92 +937,117 @@ elif page == "월수입지출(핵심)":
         mime="text/csv"
     )
 
-    st.subheader("일자 상세(거래 + 메디칼론 이벤트 마킹)")
-    first, _ = month_range(year, month)
-    sel_date = st.date_input("조회할 날짜", value=first, key="detail_date")
+    st.caption("※ 거래 파일을 업로드하면 actual(실제) 칼럼들이 자동으로 채워지고, 현재는 예정(plans) 기반 와이어프레임 모드로 동작합니다.")
 
-    confirmed_out = {p[0] for p in st.session_state.confirmed_pairs}
-    confirmed_in = {p[1] for p in st.session_state.confirmed_pairs}
-    excluded_ids = confirmed_out.union(confirmed_in)
+# =========================================================
+# Page: Internal transfer review
+# =========================================================
+elif page == "내부이동 검수":
+    st.header("내부이동 후보 검수(세션)")
 
-    day_tx = tx[(tx["biz_date"] == sel_date) & (~tx["is_excluded_account"]) & (~tx["tx_id"].isin(excluded_ids))].copy()
-    if day_tx.empty:
-        st.info("해당 날짜 거래가 없습니다.")
+    if tx.empty:
+        st.info("거래 파일을 업로드하면 내부이동 후보가 생성됩니다.")
     else:
-        if drawdown_keywords:
-            pat = "|".join([re.escape(k) for k in drawdown_keywords if k.strip()])
-            is_dd = (day_tx["direction"]=="IN") & (day_tx["counterparty"].astype(str).str.contains(pat, na=False))
-            is_dd = is_dd & (~day_tx["counterparty"].astype(str).str.contains("원금|이자", na=False))
-            day_tx["is_drawdown_calc"] = is_dd
+        cand = build_internal_candidates(tx)
+        if cand.empty:
+            st.info("내부이동 후보가 없습니다.")
         else:
-            day_tx["is_drawdown_calc"] = False
+            st.write(f"후보 {len(cand):,}쌍 (체크하면 내부이동 확정 → 집계에서 제외)")
+            for _, r in cand.sort_values("time_diff_seconds").iterrows():
+                key = (r["out_tx_id"], r["in_tx_id"])
+                default = key in st.session_state.confirmed_pairs
 
-        def loan_tag(r):
-            if r["is_principal"]:
-                return "원금상환(+여유액)"
-            if r["is_drawdown_calc"]:
-                return "대출사용(-여유액)"
-            if r["is_interest"]:
-                return "이자(현금↓)"
-            return ""
+                left, mid, right = st.columns([7,7,2])
+                with left:
+                    st.markdown(f"**OUT** {r['out_time']} / {r['out_account']} / {fmt_int(r['amount'])}")
+                    if r.get("out_counterparty"):
+                        st.caption(f"{r['out_counterparty']}")
+                with mid:
+                    st.markdown(f"**IN**  {r['in_time']} / {r['in_account']} / {fmt_int(r['amount'])}")
+                    if r.get("in_counterparty"):
+                        st.caption(f"{r['in_counterparty']}")
+                    st.caption(f"time diff: {int(r['time_diff_seconds'])}s")
+                with right:
+                    checked = st.checkbox("확정", value=default, key=f"it_{r['out_tx_id']}_{r['in_tx_id']}")
+                    if checked:
+                        st.session_state.confirmed_pairs.add(key)
+                    else:
+                        st.session_state.confirmed_pairs.discard(key)
 
-        day_tx["loan_event"] = day_tx.apply(loan_tag, axis=1)
+        st.caption("※ 다음 단계에서 internal_transfers(구글시트)에 CONFIRMED/REJECTED로 영구 저장까지 붙여서 완전 자동화할 수 있습니다.")
 
-        disp2 = day_tx.sort_values("posted_at")[["posted_at","account_name","direction","subtype","amount","counterparty","loan_event","source","file_name"]].copy()
-        disp2["시간"] = disp2["posted_at"].astype(str)
-        disp2["금액"] = disp2["amount"].map(fmt_int)
+# =========================================================
+# Page: Daily summary
+# =========================================================
+elif page == "일자별 요약":
+    st.header("일자별 요약")
 
-        st.dataframe(
-            disp2[["시간","account_name","direction","subtype","금액","counterparty","loan_event","source","file_name"]],
-            use_container_width=True,
-            hide_index=True
-        )
+    if tx.empty:
+        st.info("거래 파일을 업로드하면 실제 입/출금 요약이 생성됩니다.")
+    else:
+        daily = daily_aggregations(tx, st.session_state.confirmed_pairs, drawdown_keywords).sort_values("biz_date")
+        if daily.empty:
+            st.info("데이터가 없습니다.")
+        else:
+            disp = daily.copy()
+            disp["날짜"] = disp["biz_date"].astype(str)
+            for col in ["actual_in_claim","actual_in","actual_out_oper","principal","interest","drawdown","loan_delta","cash_net"]:
+                disp[col] = disp[col].map(fmt_int)
+            st.dataframe(
+                disp[["날짜","actual_in_claim","actual_in","actual_out_oper","principal","interest","drawdown","loan_delta","cash_net"]],
+                use_container_width=True,
+                hide_index=True
+            )
 
 # =========================================================
 # Page: Ledger
 # =========================================================
 else:
     st.header("원장(거래 목록)")
-    q = st.text_input("검색(계좌/상대/파일명)", value="")
-    df = tx.copy()
 
-    if q.strip():
-        mask = (
-            df["account_name"].astype(str).str.contains(q, na=False) |
-            df["counterparty"].astype(str).str.contains(q, na=False) |
-            df["file_name"].astype(str).str.contains(q, na=False)
-        )
-        df = df[mask]
-
-    df = df.sort_values("posted_at", ascending=False).head(800)
-
-    if drawdown_keywords:
-        pat = "|".join([re.escape(k) for k in drawdown_keywords if k.strip()])
-        is_dd = (df["direction"]=="IN") & (df["counterparty"].astype(str).str.contains(pat, na=False))
-        is_dd = is_dd & (~df["counterparty"].astype(str).str.contains("원금|이자", na=False))
-        df["is_drawdown_calc"] = is_dd
+    if tx.empty:
+        st.info("거래 파일을 업로드하면 원장이 표시됩니다.")
     else:
-        df["is_drawdown_calc"] = False
+        q = st.text_input("검색(계좌/상대/파일명)", value="")
+        df = tx.copy()
 
-    def loan_tag(r):
-        if r["is_principal"]:
-            return "원금상환"
-        if r["is_drawdown_calc"]:
-            return "대출사용"
-        if r["is_interest"]:
-            return "이자"
-        return ""
+        if q.strip():
+            mask = (
+                df["account_name"].astype(str).str.contains(q, na=False) |
+                df["counterparty"].astype(str).str.contains(q, na=False) |
+                df["file_name"].astype(str).str.contains(q, na=False)
+            )
+            df = df[mask]
 
-    df["loan_event"] = df.apply(loan_tag, axis=1)
+        df = df.sort_values("posted_at", ascending=False).head(800)
 
-    disp = df[["posted_at","biz_date","account_name","direction","subtype","amount","counterparty","balance","loan_event","source","file_name"]].copy()
-    disp["일시"] = disp["posted_at"].astype(str)
-    disp["일자"] = disp["biz_date"].astype(str)
-    disp["금액"] = disp["amount"].map(fmt_int)
-    disp["잔액"] = disp["balance"].map(fmt_int)
+        if drawdown_keywords:
+            pat = "|".join([re.escape(k) for k in drawdown_keywords if k.strip()])
+            is_dd = (df["direction"]=="IN") & (df["counterparty"].astype(str).str.contains(pat, na=False))
+            is_dd = is_dd & (~df["counterparty"].astype(str).str.contains("원금|이자", na=False))
+            df["is_drawdown_calc"] = is_dd
+        else:
+            df["is_drawdown_calc"] = False
 
-    st.dataframe(
-        disp[["일시","일자","account_name","direction","subtype","금액","counterparty","잔액","loan_event","source","file_name"]],
-        use_container_width=True,
-        hide_index=True
-    )
+        def loan_tag(r):
+            if r["is_principal"]:
+                return "원금상환"
+            if r["is_drawdown_calc"]:
+                return "대출사용"
+            if r["is_interest"]:
+                return "이자"
+            return ""
+
+        df["loan_event"] = df.apply(loan_tag, axis=1)
+
+        disp = df[["posted_at","biz_date","account_name","direction","subtype","amount","counterparty","balance","loan_event","source","file_name"]].copy()
+        disp["일시"] = disp["posted_at"].astype(str)
+        disp["일자"] = disp["biz_date"].astype(str)
+        disp["금액"] = disp["amount"].map(fmt_int)
+        disp["잔액"] = disp["balance"].map(fmt_int)
+
+        st.dataframe(
+            disp[["일시","일자","account_name","direction","subtype","금액","counterparty","잔액","loan_event","source","file_name"]],
+            use_container_width=True,
+            hide_index=True
+        )
