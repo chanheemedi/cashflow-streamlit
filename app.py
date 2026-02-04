@@ -48,7 +48,12 @@ def read_df(sheet_name: str) -> pd.DataFrame:
         return pd.DataFrame()
     header = values[0]
     rows = values[1:]
-    return pd.DataFrame(rows, columns=header)
+    df = pd.DataFrame(rows, columns=header)
+
+    # ✅ 완전 빈 줄 제거(모든 컬럼이 공백)
+    df = df.replace("", np.nan)
+    df = df.dropna(how="all").fillna("")
+    return df
 
 def overwrite_df(sheet_name: str, df: pd.DataFrame):
     if not DB_ENABLED:
