@@ -93,6 +93,104 @@ def overwrite_df(sheet_name: str, df: pd.DataFrame):
     w.update([df.columns.tolist()] + df.astype(str).fillna("").values.tolist())
 
 # =========================================================
+# internal_transfers DB helpers
+# =========================================================
+IT_SHEET = "internal_transfers"
+IT_COLS = ["out_tx_id", "in_tx_id", "status", "updated_at", "note"]
+IT_STATUSES = ["AUTO", "CONFIRMED", "REJECTED"]  # AUTO=미결(저장안함)
+
+def load_it_db() -> pd.DataFrame:
+    """Google Sheets internal_transfers 로드(중복키는 최신 updated_at 1건만 유지)."""
+    if not DB_ENABLED:
+        return pd.DataFrame(columns=IT_COLS)
+
+    df = read_df(IT_SHEET)
+    if df is None or df.empty:
+        return pd.DataFrame(columns=IT_COLS)
+
+    # 컬럼 보정
+    for c in IT_COLS:
+        if c not in df.columns:
+            df[c] = ""
+
+    df = df[IT_COLS].copy()
+    df = df.replace("", np.nan).dropna(subset=["out_tx_id", "in_tx_id"], how="any").fillna("")
+
+    df["status"] = df["status"].astype(str).str.upper().replace({"TRUE":"CONFIRMED","FALSE":"REJECTED"})
+    df.loc[~df["status"].isin(["CONFIRMED","REJECTED"]), "status"] = ""
+
+    # 최신 1건 유지(문자열 시간 정렬로 충분)
+    df = df.sort_values("updated_at", na_position="last")
+    df = df.drop_duplicates(subset=["out_tx_id", "in_tx_id"], keep="last")
+    return df
+
+def it_map_from_df(df: pd.DataFrame) -> dict:
+    """{(out,in): {'status':..., 'note':...}}"""
+    m = {}
+    if df is None or df.empty:
+        return m
+    for _, r in df.iterrows():
+        k = (str(r["out_tx_id"]), str(r["in_tx_id"]))
+        stt = str(r.get("status","")).upper()
+        note = str(r.get("note",""))
+        if stt in ["CONFIRMED","REJECTED"]:
+            m[k] = {"status": stt, "note": note}
+    return m
+
+def upsert_it_db(decisions: dict) -> None:
+    """
+    decisions: {(out,in): {'status': 'CONFIRMED'|'REJECTED', 'note': '...'}}
+    DB는 (out,in) 키로 upsert.
+    """
+    if not DB_ENABLED:
+        return
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cur = load_it_db()
+
+    # 현재 DB를 map으로
+    cur_map = {}
+    if not cur.empty:
+        for _, r in cur.iterrows():
+            cur_map[(str(r["out_tx_id"]), str(r["in_tx_id"]))] = {
+                "status": str(r.get("status","")).upper(),
+                "updated_at": str(r.get("updated_at","")),
+                "note": str(r.get("note","")),
+            }
+
+    # 업데이트 반영
+    for k, v in decisions.items():
+        stt = str(v.get("status","")).upper()
+        note = str(v.get("note",""))
+        if stt not in ["CONFIRMED","REJECTED"]:
+            continue
+        cur_map[(str(k[0]), str(k[1]))] = {
+            "status": stt,
+            "updated_at": now,
+            "note": note,
+        }
+
+    # 다시 DF로 저장
+    out_rows = []
+    for (out_id, in_id), vv in cur_map.items():
+        out_rows.append({
+            "out_tx_id": out_id,
+            "in_tx_id": in_id,
+            "status": vv.get("status",""),
+            "updated_at": vv.get("updated_at",""),
+            "note": vv.get("note",""),
+        })
+    out_df = pd.DataFrame(out_rows, columns=IT_COLS).sort_values("updated_at", na_position="last")
+    overwrite_df(IT_SHEET, out_df)
+
+def sync_confirmed_pairs_from_it_map():
+    """it_status_map 기반으로 confirmed_pairs(집계 제외 대상) 갱신"""
+    it_map = st.session_state.get("it_status_map", {})
+    st.session_state.confirmed_pairs = {k for k,v in it_map.items() if v.get("status")=="CONFIRMED"}
+    st.session_state.rejected_pairs = {k for k,v in it_map.items() if v.get("status")=="REJECTED"}
+
+
+# =========================================================
 # Display helpers
 # =========================================================
 def fmt_int(x):
@@ -739,6 +837,19 @@ if files:
 if "confirmed_pairs" not in st.session_state:
     st.session_state.confirmed_pairs = set()
 
+# --- internal_transfers(DB) load (1회)
+if "it_status_map" not in st.session_state:
+    st.session_state.it_status_map = {}
+    if DB_ENABLED:
+        try:
+            it_df = load_it_db()
+            st.session_state.it_status_map = it_map_from_df(it_df)
+        except Exception:
+            st.session_state.it_status_map = {}
+
+# confirmed/rejected set 동기화
+sync_confirmed_pairs_from_it_map()
+
 # ---- anchor resolution
 anchor_info = None
 if anchors and not tx.empty:
@@ -942,39 +1053,93 @@ if page == "월수입지출(핵심)":
 # =========================================================
 # Page: Internal transfer review
 # =========================================================
-elif page == "내부이동 검수":
-    st.header("내부이동 후보 검수(세션)")
+if page == "내부이동 검수":
+    st.header("내부이동 후보 검수 (DB 영구 저장)")
 
     if tx.empty:
         st.info("거래 파일을 업로드하면 내부이동 후보가 생성됩니다.")
-    else:
-        cand = build_internal_candidates(tx)
-        if cand.empty:
-            st.info("내부이동 후보가 없습니다.")
-        else:
-            st.write(f"후보 {len(cand):,}쌍 (체크하면 내부이동 확정 → 집계에서 제외)")
-            for _, r in cand.sort_values("time_diff_seconds").iterrows():
-                key = (r["out_tx_id"], r["in_tx_id"])
-                default = key in st.session_state.confirmed_pairs
+        st.stop()
 
-                left, mid, right = st.columns([7,7,2])
-                with left:
-                    st.markdown(f"**OUT** {r['out_time']} / {r['out_account']} / {fmt_int(r['amount'])}")
-                    if r.get("out_counterparty"):
-                        st.caption(f"{r['out_counterparty']}")
-                with mid:
-                    st.markdown(f"**IN**  {r['in_time']} / {r['in_account']} / {fmt_int(r['amount'])}")
-                    if r.get("in_counterparty"):
-                        st.caption(f"{r['in_counterparty']}")
-                    st.caption(f"time diff: {int(r['time_diff_seconds'])}s")
-                with right:
-                    checked = st.checkbox("확정", value=default, key=f"it_{r['out_tx_id']}_{r['in_tx_id']}")
-                    if checked:
-                        st.session_state.confirmed_pairs.add(key)
-                    else:
-                        st.session_state.confirmed_pairs.discard(key)
+    # DB에서 읽어온 상태
+    it_map = st.session_state.get("it_status_map", {})
+    rejected = st.session_state.get("rejected_pairs", set())
 
-        st.caption("※ 다음 단계에서 internal_transfers(구글시트)에 CONFIRMED/REJECTED로 영구 저장까지 붙여서 완전 자동화할 수 있습니다.")
+    cand = build_internal_candidates(tx)
+
+    # ✅ REJECTED는 다음부터 후보에서 자동 제외(원하면 주석처리 가능)
+    if not cand.empty and rejected:
+        keys = list(zip(cand["out_tx_id"].astype(str), cand["in_tx_id"].astype(str)))
+        mask = [k not in rejected for k in keys]
+        cand = cand.loc[mask].copy()
+
+    top1, top2, top3 = st.columns([2,2,6])
+    with top1:
+        if st.button("DB에서 새로고침", use_container_width=True, disabled=(not DB_ENABLED)):
+            it_df = load_it_db()
+            st.session_state.it_status_map = it_map_from_df(it_df)
+            sync_confirmed_pairs_from_it_map()
+            st.success("새로고침 완료")
+
+    with top2:
+        save_clicked = st.button("DB 저장", use_container_width=True, disabled=(not DB_ENABLED))
+
+    if cand.empty:
+        st.info("내부이동 후보가 없습니다.")
+        st.stop()
+
+    st.caption("AUTO=미결(저장 안함), CONFIRMED=내부이체 확정(집계에서 제외), REJECTED=내부이체 아님(다음부터 자동 제외)")
+
+    decisions_to_save = {}  # {(out,in): {'status':..., 'note':...}}
+
+    for _, r in cand.sort_values("time_diff_seconds").iterrows():
+        k = (str(r["out_tx_id"]), str(r["in_tx_id"]))
+        db_status = it_map.get(k, {}).get("status", "AUTO")
+        db_note = it_map.get(k, {}).get("note", "")
+
+        left, mid, right = st.columns([7,7,4])
+
+        with left:
+            st.markdown(f"**OUT** {r['out_time']} / {r['out_account']} / {fmt_int(r['amount'])}")
+            if r.get("out_counterparty"):
+                st.caption(f"{r['out_counterparty']}")
+
+        with mid:
+            st.markdown(f"**IN**  {r['in_time']} / {r['in_account']} / {fmt_int(r['amount'])}")
+            if r.get("in_counterparty"):
+                st.caption(f"{r['in_counterparty']}")
+            st.caption(f"time diff: {int(r['time_diff_seconds'])}s")
+
+        with right:
+            sel = st.selectbox(
+                "상태",
+                options=IT_STATUSES,
+                index=IT_STATUSES.index(db_status) if db_status in IT_STATUSES else 0,
+                key=f"it_status_{k[0]}_{k[1]}",
+            )
+            note = st.text_input(
+                "메모",
+                value=db_note,
+                key=f"it_note_{k[0]}_{k[1]}",
+            )
+
+            # 화면상 상태를 세션 map에 반영(즉시)
+            if sel in ["CONFIRMED","REJECTED"]:
+                st.session_state.it_status_map[k] = {"status": sel, "note": note}
+            else:
+                # AUTO로 돌리면 세션에서 제거(=DB 저장 대상 아님)
+                if k in st.session_state.it_status_map:
+                    st.session_state.it_status_map.pop(k, None)
+
+            # 저장 클릭 시에만 DB로 업서트할 것만 모음
+            if sel in ["CONFIRMED","REJECTED"]:
+                decisions_to_save[k] = {"status": sel, "note": note}
+
+    # confirmed_pairs(집계 제외) 동기화
+    sync_confirmed_pairs_from_it_map()
+
+    if save_clicked:
+        upsert_it_db(decisions_to_save)
+        st.success(f"DB 저장 완료: {len(decisions_to_save)}건")
 
 # =========================================================
 # Page: Daily summary
