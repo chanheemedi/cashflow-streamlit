@@ -98,6 +98,7 @@ def overwrite_df(sheet_name: str, df: pd.DataFrame):
 IT_SHEET = "internal_transfers"
 IT_COLS = ["out_tx_id", "in_tx_id", "status", "updated_at", "note"]
 IT_STATUSES = ["AUTO", "CONFIRMED", "REJECTED"]  # AUTO=미결(저장안함)
+DEFAULT_NEW_CAND_STATUS = "CONFIRMED"
 
 def load_it_db() -> pd.DataFrame:
     """Google Sheets internal_transfers 로드(중복키는 최신 updated_at 1건만 유지)."""
@@ -1054,47 +1055,184 @@ if page == "월수입지출(핵심)":
 # Page: Internal transfer review
 # =========================================================
 if page == "내부이동 검수":
-    st.header("내부이동 후보 검수 (DB 영구 저장)")
+    st.header("내부이동 후보 검수 (자동 CONFIRMED + 예외만 수정 → DB 저장)")
 
     if tx.empty:
         st.info("거래 파일을 업로드하면 내부이동 후보가 생성됩니다.")
         st.stop()
 
     # DB에서 읽어온 상태
-    it_map = st.session_state.get("it_status_map", {})
-    rejected = st.session_state.get("rejected_pairs", set())
+    if "it_status_map" not in st.session_state:
+        st.session_state.it_status_map = {}
+    it_map = st.session_state.it_status_map
 
     cand = build_internal_candidates(tx)
-
-    # ✅ REJECTED는 다음부터 후보에서 자동 제외(원하면 주석처리 가능)
-    if not cand.empty and rejected:
-        keys = list(zip(cand["out_tx_id"].astype(str), cand["in_tx_id"].astype(str)))
-        mask = [k not in rejected for k in keys]
-        cand = cand.loc[mask].copy()
-
-    top1, top2, top3 = st.columns([2,2,6])
-    with top1:
-        if st.button("DB에서 새로고침", use_container_width=True, disabled=(not DB_ENABLED)):
-            it_df = load_it_db()
-            st.session_state.it_status_map = it_map_from_df(it_df)
-            sync_confirmed_pairs_from_it_map()
-            st.success("새로고침 완료")
-
-    with top2:
-        save_clicked = st.button("DB 저장", use_container_width=True, disabled=(not DB_ENABLED))
-
     if cand.empty:
         st.info("내부이동 후보가 없습니다.")
         st.stop()
 
-    st.caption("AUTO=미결(저장 안함), CONFIRMED=내부이체 확정(집계에서 제외), REJECTED=내부이체 아님(다음부터 자동 제외)")
+    # ---------------------------------------------------------
+    # 상단 컨트롤 (필터/일괄)
+    # ---------------------------------------------------------
+    cA, cB, cC, cD, cE = st.columns([2,2,2,2,4])
 
+    with cA:
+        show_rejected = st.checkbox("REJECTED 표시", value=False)
+    with cB:
+        only_unsaved = st.checkbox("미저장 변경만 보기", value=False)
+    with cC:
+        status_filter = st.multiselect(
+            "상태 필터",
+            options=["AUTO", "CONFIRMED", "REJECTED"],
+            default=["CONFIRMED", "AUTO"],
+        )
+    with cD:
+        save_clicked = st.button("DB 저장", use_container_width=True, disabled=(not DB_ENABLED))
+    with cE:
+        st.caption("기본은 신규 후보를 CONFIRMED로 제안합니다. 예외만 REJECTED/AUTO로 바꾸고 저장하세요.")
+
+    # 후보 키 리스트
+    cand["k_out"] = cand["out_tx_id"].astype(str)
+    cand["k_in"] = cand["in_tx_id"].astype(str)
+    keys = list(zip(cand["k_out"], cand["k_in"]))
+
+    # ---------------------------------------------------------
+    # 1) 기본값(신규 후보=CONFIRMED)을 세션에 미리 세팅
+    #    - DB에 저장된 값이 있으면 그걸 우선
+    # ---------------------------------------------------------
+    for (out_id, in_id) in keys:
+        k = (out_id, in_id)
+        st_key = f"it_status_{out_id}_{in_id}"
+        note_key = f"it_note_{out_id}_{in_id}"
+
+        if st_key not in st.session_state:
+            db_status = it_map.get(k, {}).get("status", "")
+            if db_status in ["CONFIRMED", "REJECTED"]:
+                st.session_state[st_key] = db_status
+            else:
+                st.session_state[st_key] = DEFAULT_NEW_CAND_STATUS  # 신규는 기본 CONFIRMED
+
+        if note_key not in st.session_state:
+            st.session_state[note_key] = it_map.get(k, {}).get("note", "")
+
+    # ---------------------------------------------------------
+    # 2) 일괄 버튼 (현재 후보 전체 CONFIRMED / AUTO)
+    #    - 위에서 세션키를 미리 만들었으니 안정적으로 작동
+    # ---------------------------------------------------------
+    b1, b2, b3, b4 = st.columns([2,2,2,6])
+    with b1:
+        bulk_confirm = st.button("현재 후보 전체 CONFIRMED", use_container_width=True)
+    with b2:
+        bulk_auto = st.button("현재 후보 전체 AUTO(저장안함)", use_container_width=True)
+    with b3:
+        refresh_db = st.button("DB에서 새로고침", use_container_width=True, disabled=(not DB_ENABLED))
+    with b4:
+        st.caption("TIP: 대부분 내부이체면 ‘전체 CONFIRMED’ → 예외만 REJECTED로 바꾸고 저장이 가장 빠릅니다.")
+
+    if refresh_db and DB_ENABLED:
+        it_df = load_it_db()
+        st.session_state.it_status_map = it_map_from_df(it_df)
+        sync_confirmed_pairs_from_it_map()
+        st.success("새로고침 완료")
+        st.rerun()
+
+    if bulk_confirm:
+        for (out_id, in_id) in keys:
+            st.session_state[f"it_status_{out_id}_{in_id}"] = "CONFIRMED"
+            k = (out_id, in_id)
+            st.session_state.it_status_map[k] = {"status": "CONFIRMED", "note": st.session_state.get(f"it_note_{out_id}_{in_id}", "")}
+        sync_confirmed_pairs_from_it_map()
+        st.rerun()
+
+    if bulk_auto:
+        for (out_id, in_id) in keys:
+            st.session_state[f"it_status_{out_id}_{in_id}"] = "AUTO"
+            k = (out_id, in_id)
+            if k in st.session_state.it_status_map:
+                st.session_state.it_status_map.pop(k, None)
+        sync_confirmed_pairs_from_it_map()
+        st.rerun()
+
+    # ---------------------------------------------------------
+    # 3) 필터 적용 (REJECTED 숨김/상태필터/미저장만)
+    # ---------------------------------------------------------
+    def effective_status(out_id: str, in_id: str) -> str:
+        st_key = f"it_status_{out_id}_{in_id}"
+        v = st.session_state.get(st_key, "AUTO")
+        return v if v in ["AUTO","CONFIRMED","REJECTED"] else "AUTO"
+
+    def effective_note(out_id: str, in_id: str) -> str:
+        return st.session_state.get(f"it_note_{out_id}_{in_id}", "")
+
+    def db_status_note(k):
+        dbs = it_map.get(k, {}).get("status", "")
+        dbn = it_map.get(k, {}).get("note", "")
+        return dbs, dbn
+
+    visible_mask = []
+    for (out_id, in_id) in keys:
+        k = (out_id, in_id)
+        s_eff = effective_status(out_id, in_id)
+
+        # 1) REJECTED 표시 옵션
+        if (not show_rejected) and (s_eff == "REJECTED"):
+            visible_mask.append(False)
+            continue
+
+        # 2) 상태 필터
+        if s_eff not in status_filter:
+            visible_mask.append(False)
+            continue
+
+        # 3) 미저장만 보기 (DB와 다르면 True)
+        if only_unsaved:
+            dbs, dbn = db_status_note(k)
+            # AUTO는 저장 안 하므로 "미저장 변경" 판단을 이렇게:
+            # - AUTO인데 DB에 CONFIRMED/REJECTED가 있으면 변경(=삭제효과) -> 저장 로직상 DB에서 제거는 안 하므로
+            #   운영상 AUTO는 '저장대상 아님'으로 보고, 미저장 보기에서는 제외하는 게 혼란 적음
+            if s_eff == "AUTO":
+                visible_mask.append(False)
+                continue
+            if (dbs != s_eff) or (str(dbn) != str(effective_note(out_id, in_id))):
+                visible_mask.append(True)
+            else:
+                visible_mask.append(False)
+            continue
+
+        visible_mask.append(True)
+
+    cand_view = cand.loc[visible_mask].copy()
+
+    # 요약 지표
+    total_n = len(cand)
+    visible_n = len(cand_view)
+    confirmed_n = sum(1 for (o,i) in keys if effective_status(o,i) == "CONFIRMED")
+    rejected_n = sum(1 for (o,i) in keys if effective_status(o,i) == "REJECTED")
+    auto_n = sum(1 for (o,i) in keys if effective_status(o,i) == "AUTO")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("후보(전체)", f"{total_n:,}")
+    m2.metric("후보(표시중)", f"{visible_n:,}")
+    m3.metric("CONFIRMED", f"{confirmed_n:,}")
+    m4.metric("REJECTED / AUTO", f"{rejected_n:,} / {auto_n:,}")
+
+    if cand_view.empty:
+        st.info("필터 조건에 해당하는 후보가 없습니다.")
+        st.stop()
+
+    st.caption("AUTO=미결(저장 안함), CONFIRMED=내부이체 확정(집계 제외), REJECTED=내부이체 아님(다음부터 후보에서 숨김 가능)")
+
+    # ---------------------------------------------------------
+    # 4) 후보 리스트 렌더링 + 저장할 변경분 계산
+    # ---------------------------------------------------------
     decisions_to_save = {}  # {(out,in): {'status':..., 'note':...}}
 
-    for _, r in cand.sort_values("time_diff_seconds").iterrows():
-        k = (str(r["out_tx_id"]), str(r["in_tx_id"]))
-        db_status = it_map.get(k, {}).get("status", "AUTO")
-        db_note = it_map.get(k, {}).get("note", "")
+    for _, r in cand_view.sort_values("time_diff_seconds").iterrows():
+        out_id = str(r["out_tx_id"]); in_id = str(r["in_tx_id"])
+        k = (out_id, in_id)
+
+        st_key = f"it_status_{out_id}_{in_id}"
+        note_key = f"it_note_{out_id}_{in_id}"
 
         left, mid, right = st.columns([7,7,4])
 
@@ -1112,34 +1250,41 @@ if page == "내부이동 검수":
         with right:
             sel = st.selectbox(
                 "상태",
-                options=IT_STATUSES,
-                index=IT_STATUSES.index(db_status) if db_status in IT_STATUSES else 0,
-                key=f"it_status_{k[0]}_{k[1]}",
+                options=IT_STATUSES,  # ["AUTO","CONFIRMED","REJECTED"]
+                index=IT_STATUSES.index(st.session_state[st_key]) if st.session_state[st_key] in IT_STATUSES else 0,
+                key=st_key,
             )
-            note = st.text_input(
-                "메모",
-                value=db_note,
-                key=f"it_note_{k[0]}_{k[1]}",
-            )
+            note = st.text_input("메모", key=note_key)
 
-            # 화면상 상태를 세션 map에 반영(즉시)
+            # 즉시 세션 map 반영
             if sel in ["CONFIRMED","REJECTED"]:
                 st.session_state.it_status_map[k] = {"status": sel, "note": note}
             else:
-                # AUTO로 돌리면 세션에서 제거(=DB 저장 대상 아님)
-                if k in st.session_state.it_status_map:
-                    st.session_state.it_status_map.pop(k, None)
+                st.session_state.it_status_map.pop(k, None)
 
-            # 저장 클릭 시에만 DB로 업서트할 것만 모음
+            # 저장 대상 판단(현재값 vs DB값)
+            dbs = it_map.get(k, {}).get("status", "")
+            dbn = it_map.get(k, {}).get("note", "")
             if sel in ["CONFIRMED","REJECTED"]:
-                decisions_to_save[k] = {"status": sel, "note": note}
+                if (dbs != sel) or (str(dbn) != str(note)):
+                    decisions_to_save[k] = {"status": sel, "note": note}
 
-    # confirmed_pairs(집계 제외) 동기화
+    # 집계 제외 동기화
     sync_confirmed_pairs_from_it_map()
 
+    st.info(f"저장 예정 변경: {len(decisions_to_save):,}건 (DB 저장 버튼 누르면 반영됩니다.)")
+
+    # ---------------------------------------------------------
+    # 5) 저장 버튼 처리
+    # ---------------------------------------------------------
     if save_clicked:
         upsert_it_db(decisions_to_save)
-        st.success(f"DB 저장 완료: {len(decisions_to_save)}건")
+        # 저장 후 재로딩(정합)
+        it_df = load_it_db()
+        st.session_state.it_status_map = it_map_from_df(it_df)
+        sync_confirmed_pairs_from_it_map()
+        st.success(f"DB 저장 완료: {len(decisions_to_save):,}건")
+        st.rerun()
 
 # =========================================================
 # Page: Daily summary
