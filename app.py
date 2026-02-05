@@ -1002,7 +1002,23 @@ if files:
             st.write(f"- {fn}: {msg}")
 
     if all_tx:
-        tx = pd.concat(all_tx, ignore_index=True).drop_duplicates(subset=["tx_id"]).sort_values("posted_at")
+        tx_upload = pd.concat(all_tx, ignore_index=True).drop_duplicates(subset=["tx_id"])
+        tx_upload = tx_upload.sort_values("posted_at")
+        auto_stack = st.sidebar.toggle("업로드 데이터 DB 누적 저장", value=True, disabled=(not DB_ENABLED))
+
+if DB_ENABLED and auto_stack and (tx_upload is not None) and (not tx_upload.empty):
+    try:
+        added = append_new_transactions(tx_upload)
+        if added > 0:
+            st.sidebar.success(f"transactions DB 누적: +{added:,}건")
+        else:
+            st.sidebar.info("transactions DB 누적: 추가 없음(모두 기존 tx)")
+    except Exception as e:
+        st.sidebar.error(f"transactions 누적 실패: {e}")
+tx_db = read_transactions_db() if DB_ENABLED else pd.DataFrame()
+tx = pd.concat([tx_db, tx_upload], ignore_index=True).drop_duplicates(subset=["tx_id"])
+tx = tx.sort_values("posted_at")
+
 
 # ---- session state
 if "confirmed_pairs" not in st.session_state:
