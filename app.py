@@ -62,16 +62,26 @@ def gs_client():
     )
     return gspread.authorize(creds)
 
-def ws(name: str):
+# ✅ Spreadsheet / Worksheet 캐시 (rerun 때마다 open/read 폭주 방지)
+@st.cache_resource
+def gs_spreadsheet():
     sheet_id = _normalize_sheet_id(st.secrets["app"]["sheet_id"])
-    sh = gs_client().open_by_key(sheet_id)
-    return sh.worksheet(name)
+    return gs_client().open_by_key(sheet_id)
+
+@st.cache_resource
+def ws(name: str):
+    return gs_spreadsheet().worksheet(name)
+
+# ✅ read quota 방지 핵심: 시트 read 결과를 TTL 캐싱
+#   (필요시 ttl=60~180으로 늘리면 429 더 줄어듭니다)
+@st.cache_data(ttl=30, show_spinner=False)
+def _get_all_values_cached(sheet_name: str) -> list[list[str]]:
+    return ws(sheet_name).get_all_values()
 
 def read_df(sheet_name: str) -> pd.DataFrame:
     if not DB_ENABLED:
         return pd.DataFrame()
-    w = ws(sheet_name)
-    values = w.get_all_values()
+    values = _get_all_values_cached(sheet_name)
     if not values:
         return pd.DataFrame()
     header = values[0]
@@ -89,8 +99,17 @@ def overwrite_df(sheet_name: str, df: pd.DataFrame):
     w.clear()
     if df is None or df.empty:
         # 헤더만이라도 유지하려면 필요시 여기에서 처리 가능
+        try:
+            _get_all_values_cached.clear()
+        except Exception:
+            pass
         return
     w.update([df.columns.tolist()] + df.astype(str).fillna("").values.tolist())
+    # ✅ 쓰기 후 캐시 무효화
+    try:
+        _get_all_values_cached.clear()
+    except Exception:
+        pass
 
 # =========================================================
 # internal_transfers DB helpers
@@ -189,7 +208,6 @@ def sync_confirmed_pairs_from_it_map():
     it_map = st.session_state.get("it_status_map", {})
     st.session_state.confirmed_pairs = {k for k,v in it_map.items() if v.get("status")=="CONFIRMED"}
     st.session_state.rejected_pairs = {k for k,v in it_map.items() if v.get("status")=="REJECTED"}
-
 
 # =========================================================
 # Display helpers
@@ -800,6 +818,13 @@ def append_df(sheet_name: str, df: pd.DataFrame, chunk_size: int = 400):
     # chunk append
     for i in range(0, len(rows), chunk_size):
         w.append_rows(rows[i:i+chunk_size], value_input_option="RAW")
+
+    # ✅ append 후 캐시 무효화(다음 read는 최신)
+    try:
+        _get_all_values_cached.clear()
+    except Exception:
+        pass
+
     return len(rows)
 
 def get_existing_tx_ids() -> set[str]:
@@ -1012,7 +1037,6 @@ if files:
         st.error("일부 파일 파싱 실패")
         for fn, msg in parse_errors:
             st.write(f"- {fn}: {msg}")
-        # 여기서 멈출지 여부는 선택(원하면 st.stop())
 
     if all_tx:
         tx_upload = pd.concat(all_tx, ignore_index=True).drop_duplicates(subset=["tx_id"])
@@ -1025,19 +1049,27 @@ auto_stack = st.sidebar.toggle(
     disabled=(not DB_ENABLED)
 )
 
-# ✅ DB 누적(append)은 tx_upload 있을 때만 실행
-if DB_ENABLED and auto_stack and (tx_upload is not None) and (not tx_upload.empty):
-    try:
-        # (옵션) 같은 업로드로 매번 rerun 때 append 시도하는 것 방지 (중복방지 로직이 있긴 하지만)
-        # sig = str(tx_upload["tx_id"].nunique())
-        # if st.session_state.get("last_stack_sig") != sig:
-        added = append_new_transactions(tx_upload)
-        # st.session_state["last_stack_sig"] = sig
+# ✅ 동일 업로드로 rerun 때마다 append 시도 방지(=read 폭탄 방지)
+def _make_stack_sig(df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return ""
+    return f"{df['tx_id'].nunique()}|{df['tx_id'].min()}|{df['tx_id'].max()}"
 
-        if added > 0:
-            st.sidebar.success(f"transactions DB 누적: +{added:,}건")
+stack_sig = _make_stack_sig(tx_upload)
+
+# ✅ DB 누적(append)은 tx_upload 있을 때만 + 같은 업로드는 1회만 실행
+if DB_ENABLED and auto_stack and stack_sig:
+    try:
+        if st.session_state.get("last_stack_sig") != stack_sig:
+            added = append_new_transactions(tx_upload)
+            st.session_state["last_stack_sig"] = stack_sig
+
+            if added > 0:
+                st.sidebar.success(f"transactions DB 누적: +{added:,}건")
+            else:
+                st.sidebar.info("transactions DB 누적: 추가 없음(모두 기존 tx)")
         else:
-            st.sidebar.info("transactions DB 누적: 추가 없음(모두 기존 tx)")
+            st.sidebar.info("transactions DB 누적: 이미 반영됨(동일 업로드)")
     except Exception as e:
         st.sidebar.error(f"transactions 누적 실패: {e}")
 
@@ -1408,9 +1440,6 @@ elif page == "내부이동 검수":
         # 3) 미저장만 보기 (DB와 다르면 True)
         if only_unsaved:
             dbs, dbn = db_status_note(k)
-            # AUTO는 저장 안 하므로 "미저장 변경" 판단을 이렇게:
-            # - AUTO인데 DB에 CONFIRMED/REJECTED가 있으면 변경(=삭제효과) -> 저장 로직상 DB에서 제거는 안 하므로
-            #   운영상 AUTO는 '저장대상 아님'으로 보고, 미저장 보기에서는 제외하는 게 혼란 적음
             if s_eff == "AUTO":
                 visible_mask.append(False)
                 continue
@@ -1441,7 +1470,7 @@ elif page == "내부이동 검수":
         st.info("필터 조건에 해당하는 후보가 없습니다.")
         st.stop()
 
-    st.caption("AUTO=미결(저장 안함), CONFIRMED=내부이체 확정(집계 제외), REJECTED=내부이체 아님(다음부터 후보에서 숨김 가능)")
+    st.caption("AUTO=미결(저장 안 함), CONFIRMED=내부이체 확정(집계 제외), REJECTED=내부이체 아님(다음부터 후보에서 숨김 가능)")
 
     # ---------------------------------------------------------
     # 4) 후보 리스트 렌더링 + 저장할 변경분 계산
