@@ -975,11 +975,13 @@ dd_kw_text = st.sidebar.text_input(
 drawdown_keywords = [x.strip() for x in dd_kw_text.split(",") if x.strip()]
 
 # ---- If no files, still render wireframe pages using empty tx
-tx = pd.DataFrame(columns=[
+BASE_TX_COLS = [
     "tx_id","posted_at","biz_date","account_name","direction","subtype","amount",
     "counterparty","balance","is_excluded_account","is_internal_auto",
     "is_principal","is_interest","is_drawdown","source","file_name"
-])
+]
+
+tx_upload = pd.DataFrame(columns=BASE_TX_COLS)   # ✅ 항상 정의
 anchors = []
 parse_errors = []
 
@@ -1000,25 +1002,45 @@ if files:
         st.error("일부 파일 파싱 실패")
         for fn, msg in parse_errors:
             st.write(f"- {fn}: {msg}")
+        # 여기서 멈출지 여부는 선택(원하면 st.stop())
 
     if all_tx:
         tx_upload = pd.concat(all_tx, ignore_index=True).drop_duplicates(subset=["tx_id"])
         tx_upload = tx_upload.sort_values("posted_at")
-        auto_stack = st.sidebar.toggle("업로드 데이터 DB 누적 저장", value=True, disabled=(not DB_ENABLED))
 
+# ✅ 토글은 files 없어도 안전하게 정의
+auto_stack = st.sidebar.toggle(
+    "업로드 데이터 DB 누적 저장",
+    value=True,
+    disabled=(not DB_ENABLED)
+)
+
+# ✅ DB 누적(append)은 tx_upload 있을 때만 실행
 if DB_ENABLED and auto_stack and (tx_upload is not None) and (not tx_upload.empty):
     try:
+        # (옵션) 같은 업로드로 매번 rerun 때 append 시도하는 것 방지 (중복방지 로직이 있긴 하지만)
+        # sig = str(tx_upload["tx_id"].nunique())
+        # if st.session_state.get("last_stack_sig") != sig:
         added = append_new_transactions(tx_upload)
+        # st.session_state["last_stack_sig"] = sig
+
         if added > 0:
             st.sidebar.success(f"transactions DB 누적: +{added:,}건")
         else:
             st.sidebar.info("transactions DB 누적: 추가 없음(모두 기존 tx)")
     except Exception as e:
         st.sidebar.error(f"transactions 누적 실패: {e}")
-tx_db = read_transactions_db() if DB_ENABLED else pd.DataFrame()
+
+# ✅ 최종 tx는 DB + 업로드 합쳐서 사용 (files 없어도 tx_db만으로 동작)
+tx_db = read_transactions_db() if DB_ENABLED else pd.DataFrame(columns=BASE_TX_COLS)
+
+# read_transactions_db가 반환하는 DF에 누락 컬럼이 있을 수 있으니 보정
+for c in BASE_TX_COLS:
+    if c not in tx_db.columns:
+        tx_db[c] = "" if c in ["counterparty","subtype","source","file_name"] else 0
+
 tx = pd.concat([tx_db, tx_upload], ignore_index=True).drop_duplicates(subset=["tx_id"])
 tx = tx.sort_values("posted_at")
-
 
 # ---- session state
 if "confirmed_pairs" not in st.session_state:
