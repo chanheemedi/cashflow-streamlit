@@ -863,12 +863,18 @@ def append_new_transactions(tx_df: pd.DataFrame) -> int:
 
 def read_transactions_db() -> pd.DataFrame:
     """DB transactions 읽어서 앱 tx 형식으로 복원."""
+    # ✅ DB 미사용/비어있어도 '컬럼 있는 빈 DF'를 반환해야 함
     if not DB_ENABLED:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=TX_COLS)
 
-    df = read_df(TX_SHEET)
+    try:
+        df = read_df(TX_SHEET)
+    except Exception:
+        # transactions 시트가 아직 없거나 접근 실패 시에도 안전하게
+        return pd.DataFrame(columns=TX_COLS)
+
     if df is None or df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=TX_COLS)
 
     # 필요한 컬럼만 + 누락 보정
     for c in TX_COLS:
@@ -878,14 +884,18 @@ def read_transactions_db() -> pd.DataFrame:
 
     # 타입 복원
     df["posted_at"] = pd.to_datetime(df["posted_at"], errors="coerce")
+    df = df[df["posted_at"].notna()].copy()
+
     df["biz_date"] = pd.to_datetime(df["biz_date"], errors="coerce").dt.date
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(int)
     df["balance"] = pd.to_numeric(df["balance"], errors="coerce")
 
     for b in ["is_excluded_account","is_internal_auto","is_principal","is_interest"]:
+        if b not in df.columns:
+            df[b] = 0
         df[b] = pd.to_numeric(df[b], errors="coerce").fillna(0).astype(int).astype(bool)
 
-    return df.dropna(subset=["posted_at"]).copy()
+    return df
 
 def save_anchor_to_db(anchor_info: dict, source_file: str = "") -> int:
     """현재 anchor_info를 anchors 탭에 append."""
