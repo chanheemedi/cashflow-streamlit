@@ -1086,6 +1086,23 @@ tx = tx.sort_values("posted_at")
 for c in BASE_TX_COLS:
     if c not in tx.columns:
         tx[c] = "" if c in ["counterparty","subtype","source","file_name"] else 0
+        # ✅ tx 스키마/타입 강제(빈 DF에서도 안전, 0/1/문자열도 bool로)
+BOOL_COLS = ["is_excluded_account","is_internal_auto","is_principal","is_interest","is_drawdown"]
+
+def _to_bool_series(s: pd.Series) -> pd.Series:
+    # 중복 컬럼 등으로 DataFrame이 들어오는 예외 방어
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+
+    x = s.copy()
+    x = x.replace({"": 0, "TRUE": 1, "FALSE": 0, True: 1, False: 0})
+    x = pd.to_numeric(x, errors="coerce").fillna(0).astype(int)
+    return x.astype(bool)
+
+for c in BOOL_COLS:
+    if c not in tx.columns:
+        tx[c] = False
+    tx[c] = _to_bool_series(tx[c])
 
 # ---- session state
 if "confirmed_pairs" not in st.session_state:
