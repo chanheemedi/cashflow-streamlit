@@ -768,6 +768,176 @@ def save_plans_month(year: int, month: int, edited: pd.DataFrame):
     overwrite_df("plans", all_df)
 
 # =========================================================
+# transactions / anchors DB helpers
+# =========================================================
+TX_SHEET = "transactions"
+TX_COLS = [
+    "tx_id","posted_at","biz_date","account_name","direction","subtype","amount",
+    "counterparty","balance","is_excluded_account","is_internal_auto","is_principal","is_interest",
+    "source","file_name","created_at"
+]
+
+ANCHOR_SHEET = "anchors"
+ANCHOR_COLS = [
+    "anchor_time","anchor_cash","anchor_loan_avail","cash_time","loan_time",
+    "missing_accounts","source_file","created_at"
+]
+
+def append_df(sheet_name: str, df: pd.DataFrame, chunk_size: int = 400):
+    """Google Sheet에 append (헤더는 유지)."""
+    if not DB_ENABLED or df is None or df.empty:
+        return 0
+    w = ws(sheet_name)
+
+    df2 = df.copy()
+    # 컬럼 순서 맞추기(없는 컬럼은 빈값)
+    for c in (TX_COLS if sheet_name==TX_SHEET else ANCHOR_COLS):
+        if c not in df2.columns:
+            df2[c] = ""
+    df2 = df2[(TX_COLS if sheet_name==TX_SHEET else ANCHOR_COLS)].copy()
+
+    rows = df2.astype(str).fillna("").values.tolist()
+    # chunk append
+    for i in range(0, len(rows), chunk_size):
+        w.append_rows(rows[i:i+chunk_size], value_input_option="RAW")
+    return len(rows)
+
+def get_existing_tx_ids() -> set[str]:
+    """transactions 탭의 tx_id(1열) 전체를 set으로."""
+    if not DB_ENABLED:
+        return set()
+    w = ws(TX_SHEET)
+    col = w.col_values(1)  # A열
+    if not col:
+        return set()
+    # 첫 행은 헤더
+    return set([x.strip() for x in col[1:] if x and x.strip()])
+
+def tx_df_for_db(tx_df: pd.DataFrame) -> pd.DataFrame:
+    """앱 tx DF -> DB 저장용 DF로 정리(형식/컬럼/타입)."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    df = tx_df.copy()
+
+    # 날짜 문자열로 저장
+    df["posted_at"] = pd.to_datetime(df["posted_at"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+    df["biz_date"] = pd.to_datetime(df["biz_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+
+    # 숫자/불리언 정리
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(int)
+    if "balance" in df.columns:
+        df["balance"] = pd.to_numeric(df["balance"], errors="coerce")
+    else:
+        df["balance"] = np.nan
+
+    for b in ["is_excluded_account","is_internal_auto","is_principal","is_interest"]:
+        if b not in df.columns:
+            df[b] = False
+        df[b] = df[b].astype(bool).astype(int)  # 0/1 저장
+
+    if "file_name" not in df.columns:
+        df["file_name"] = ""
+    if "source" not in df.columns:
+        df["source"] = ""
+
+    df["created_at"] = now
+
+    # 컬럼 맞추기
+    for c in TX_COLS:
+        if c not in df.columns:
+            df[c] = ""
+    return df[TX_COLS].copy()
+
+def append_new_transactions(tx_df: pd.DataFrame) -> int:
+    """transactions 탭에 신규 tx_id만 append."""
+    if not DB_ENABLED or tx_df is None or tx_df.empty:
+        return 0
+
+    exist = get_existing_tx_ids()
+    df = tx_df_for_db(tx_df)
+
+    df["tx_id"] = df["tx_id"].astype(str)
+    new_df = df[~df["tx_id"].isin(exist)].copy()
+    if new_df.empty:
+        return 0
+    return append_df(TX_SHEET, new_df)
+
+def read_transactions_db() -> pd.DataFrame:
+    """DB transactions 읽어서 앱 tx 형식으로 복원."""
+    if not DB_ENABLED:
+        return pd.DataFrame()
+
+    df = read_df(TX_SHEET)
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # 필요한 컬럼만 + 누락 보정
+    for c in TX_COLS:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[TX_COLS].copy()
+
+    # 타입 복원
+    df["posted_at"] = pd.to_datetime(df["posted_at"], errors="coerce")
+    df["biz_date"] = pd.to_datetime(df["biz_date"], errors="coerce").dt.date
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(int)
+    df["balance"] = pd.to_numeric(df["balance"], errors="coerce")
+
+    for b in ["is_excluded_account","is_internal_auto","is_principal","is_interest"]:
+        df[b] = pd.to_numeric(df[b], errors="coerce").fillna(0).astype(int).astype(bool)
+
+    return df.dropna(subset=["posted_at"]).copy()
+
+def save_anchor_to_db(anchor_info: dict, source_file: str = "") -> int:
+    """현재 anchor_info를 anchors 탭에 append."""
+    if not DB_ENABLED or anchor_info is None:
+        return 0
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    row = {
+        "anchor_time": str(anchor_info.get("anchor_time","")),
+        "anchor_cash": str(anchor_info.get("anchor_cash","")),
+        "anchor_loan_avail": str(anchor_info.get("anchor_loan_avail","")),
+        "cash_time": str(anchor_info.get("cash_time","")),
+        "loan_time": str(anchor_info.get("loan_time","")),
+        "missing_accounts": ",".join(anchor_info.get("missing_accounts", []) or []),
+        "source_file": source_file,
+        "created_at": now,
+    }
+    df = pd.DataFrame([row], columns=ANCHOR_COLS)
+    return append_df(ANCHOR_SHEET, df)
+
+def load_latest_anchor_from_db() -> dict | None:
+    """anchors 탭에서 가장 최신 anchor_time 1개를 anchor_info 형태로 반환."""
+    if not DB_ENABLED:
+        return None
+    df = read_df(ANCHOR_SHEET)
+    if df is None or df.empty:
+        return None
+
+    for c in ANCHOR_COLS:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[ANCHOR_COLS].copy()
+
+    df["anchor_time_dt"] = pd.to_datetime(df["anchor_time"], errors="coerce")
+    df = df[df["anchor_time_dt"].notna()].sort_values("anchor_time_dt")
+    if df.empty:
+        return None
+
+    r = df.iloc[-1]
+    missing = [x.strip() for x in str(r.get("missing_accounts","")).split(",") if x.strip()]
+
+    return {
+        "anchor_time": pd.to_datetime(r["anchor_time"], errors="coerce"),
+        "anchor_cash": float(pd.to_numeric(r["anchor_cash"], errors="coerce")),
+        "anchor_loan_avail": float(pd.to_numeric(r["anchor_loan_avail"], errors="coerce")),
+        "missing_accounts": missing,
+        "cash_time": pd.to_datetime(r["cash_time"], errors="coerce"),
+        "loan_time": pd.to_datetime(r["loan_time"], errors="coerce"),
+        "source_file": str(r.get("source_file","")),
+    }
+
+# =========================================================
 # UI
 # =========================================================
 st.title("현금흐름 MVP (업로드 → 내부이동 자동검수(DB) → 월수입지출/가용금액(DB 예정))")
