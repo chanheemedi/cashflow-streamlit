@@ -1051,6 +1051,9 @@ for c in BASE_TX_COLS:
 
 tx = pd.concat([tx_db, tx_upload], ignore_index=True).drop_duplicates(subset=["tx_id"])
 tx = tx.sort_values("posted_at")
+for c in BASE_TX_COLS:
+    if c not in tx.columns:
+        tx[c] = "" if c in ["counterparty","subtype","source","file_name"] else 0
 
 # ---- session state
 if "confirmed_pairs" not in st.session_state:
